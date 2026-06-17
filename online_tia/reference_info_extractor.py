@@ -1,11 +1,11 @@
 """Stage: full reference-info extraction pipeline.
 
-  0. **Inbox guard**: if REFERENCE_EXCEL_TO_BE_LOADED_DIR is empty, skip
+  0. **Inbox guard**: if REFERENCE_TO_BE_LOADED_DIR is empty, skip
      stages 1 and 2 entirely (REFERENCE_JSON_DIR and
      REFERENCE_JSON_EXTRACTED_DIR are left untouched). Otherwise:
-  1. Convert .xlsx/.xlsm files in REFERENCE_EXCEL_TO_BE_LOADED_DIR to
+  1. Convert .xlsx/.xlsm files in REFERENCE_TO_BE_LOADED_DIR to
      per-sheet JSON in REFERENCE_JSON_DIR (wiped first). Successfully
-     converted xlsx files are then moved to REFERENCE_EXCEL_LOADED_DIR.
+     converted xlsx files are then moved to REFERENCE_LOADED_DIR.
   2. Run a per-sheet LLM extraction over REFERENCE_JSON_DIR, writing one
      `extracted_{sheet}_{YYYYMMDD_HHMMSS}.json` per non-empty result to
      REFERENCE_JSON_EXTRACTED_DIR (wiped first).
@@ -34,8 +34,8 @@ REQUIRED_ENV_VARS = (
     "SSC_CLOUD_AIGATEWAY_USER_ID",
     "SSC_CLOUD_AIGATEWAY_MODEL",
     "USE_CASE_ID",
-    "REFERENCE_EXCEL_TO_BE_LOADED_DIR",
-    "REFERENCE_EXCEL_LOADED_DIR",
+    "REFERENCE_TO_BE_LOADED_DIR",
+    "REFERENCE_LOADED_DIR",
     "REFERENCE_JSON_DIR",
     "REFERENCE_JSON_EXTRACTED_DIR",
     "LOG_DIR",
@@ -51,8 +51,8 @@ def extract() -> int:
         return rc
 
     reference_json_dir = Path(os.environ["REFERENCE_JSON_DIR"])
-    to_be_loaded_dir = Path(os.environ["REFERENCE_EXCEL_TO_BE_LOADED_DIR"])
-    loaded_dir = Path(os.environ["REFERENCE_EXCEL_LOADED_DIR"])
+    to_be_loaded_dir = Path(os.environ["REFERENCE_TO_BE_LOADED_DIR"])
+    loaded_dir = Path(os.environ["REFERENCE_LOADED_DIR"])
 
     # Inbox guard: if nothing waiting, skip both stages — leave the JSON and
     # extracted dirs untouched so the downstream RAG sync gate sees no

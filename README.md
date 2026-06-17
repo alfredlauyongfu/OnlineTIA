@@ -16,12 +16,12 @@ own data and the RAG-retrieved reference recommendations.
                   ┌─────────────────────────────┐
                   │ 1. extract reference info   │  (idempotent: skipped if inbox empty)
                   │                             │
-   ReferenceExcel │  REFERENCE_EXCEL_TO_BE_     │
-   ToBeLoaded ─►──┤  LOADED_DIR  ▶ convert ▶ ──┼─►  REFERENCE_JSON_DIR
-                  │     │                       │     │
-                  │     │ on success            │     ▼ LLM per-sheet extract
-                  │     ▼                       │     │
-                  │  REFERENCE_EXCEL_LOADED_DIR │     ▼
+                  │  REFERENCE_TO_BE_LOADED_DIR │
+   ReferenceTo  ──┤        ▶ convert ▶          ├─►  REFERENCE_JSON_DIR
+   BeLoaded ─►    │        │                    │     │
+                  │        │ on success         │     ▼ LLM per-sheet extract
+                  │        ▼                    │     │
+                  │  REFERENCE_LOADED_DIR       │     ▼
                   │                             │  REFERENCE_JSON_EXTRACTED_DIR
                   └─────────────────────────────┘     │
                                                      │
@@ -129,7 +129,7 @@ $dirs = @(
     "IntermediateCustomerResponseJson",
     "Processing", "Processed",
     "OutputReport",
-    "ReferenceExcelToBeLoaded", "ReferenceExcelLoaded",
+    "ReferenceToBeLoaded", "ReferenceLoaded",
     "ReferenceJson", "ReferenceJsonExtracted",
     "Logs"
 )
@@ -157,7 +157,7 @@ Then open `.env` and:
 
 If you want the first run to actually populate RAG, drop a TIA reference
 workbook (e.g. `Technical Infrastructure Assessment V2.6.4.xlsm`) into
-`REFERENCE_EXCEL_TO_BE_LOADED_DIR`. Otherwise the reference stage is a
+`REFERENCE_TO_BE_LOADED_DIR`. Otherwise the reference stage is a
 no-op and the RAG sync stage runs against whatever's already in the RAG
 store at the gateway.
 
@@ -184,8 +184,8 @@ Every variable listed below is required in `.env` (the entry point's
 | `PROCESSING_DIR` | In-flight customer xlsx (claimed but not yet graduated). | `run.py` |
 | `PROCESSED_DIR` | Customer xlsx graduates here after successful conversion. | `run.py` |
 | `OUTPUT_REPORT_DIR` | Generated `TIA_<stem>_<timestamp>.md` reports. | `run.py`, `tia_generator.py` |
-| `REFERENCE_EXCEL_TO_BE_LOADED_DIR` | Reference TIA workbooks waiting to be ingested. | `reference_info_extractor.py` |
-| `REFERENCE_EXCEL_LOADED_DIR` | Reference xlsx graduates here after successful ingest. | `reference_info_extractor.py` |
+| `REFERENCE_TO_BE_LOADED_DIR` | Reference TIA workbooks waiting to be ingested. | `reference_info_extractor.py` |
+| `REFERENCE_LOADED_DIR` | Reference xlsx graduates here after successful ingest. | `reference_info_extractor.py` |
 | `REFERENCE_JSON_DIR` | Per-sheet JSON from the reference Excel conversion. Wiped each reference run. | `reference_info_extractor.py`, `reference_json_combiner.py` |
 | `REFERENCE_JSON_EXTRACTED_DIR` | Per-sheet LLM-distilled JSON. Wiped each reference run. Source for RAG ingest. | `reference_json_combiner.py`, `run.py`, `rag_ingester.py` |
 | `LOG_DIR` | Holds `logs.txt` (append-mode across runs). | all entry points |
@@ -262,12 +262,12 @@ Each `run.py` invocation does up to **two distinct things** in sequence,
 each triggered only when its inbox has files. With both inboxes empty,
 the run logs the skip lines and exits.
 
-#### 1. Reference data ingest — triggered by files in `REFERENCE_EXCEL_TO_BE_LOADED_DIR`
+#### 1. Reference data ingest — triggered by files in `REFERENCE_TO_BE_LOADED_DIR`
 
 This is how you populate the RAG knowledge base that the final report
 draws on. Drop a TIA reference workbook (e.g. an internal TIA template
 with scoring guidance, recommended configurations, severity rubrics)
-into `REFERENCE_EXCEL_TO_BE_LOADED_DIR`. The next `run.py` will:
+into `REFERENCE_TO_BE_LOADED_DIR`. The next `run.py` will:
 
 1. **Convert** each sheet of the workbook to a per-sheet JSON file in
    `REFERENCE_JSON_DIR`. This is a pure local Excel-to-JSON pass — every
@@ -295,7 +295,7 @@ into `REFERENCE_EXCEL_TO_BE_LOADED_DIR`. The next `run.py` will:
    entries are deleted and the fresh ones uploaded in their place.
 
 After successful processing the source workbook is moved from
-`REFERENCE_EXCEL_TO_BE_LOADED_DIR` into `REFERENCE_EXCEL_LOADED_DIR` so
+`REFERENCE_TO_BE_LOADED_DIR` into `REFERENCE_LOADED_DIR` so
 it isn't re-processed on the next run.
 
 #### 2. Customer report generation — triggered by files in `INPUT_DIR`
@@ -437,11 +437,11 @@ machine without VPN or gateway access.
   — those path segments are appended by the code.
 - **`No xlsx in <inbox>; skipping convert and extract stages`** — expected
   when the reference inbox is empty. To trigger reference processing, drop
-  a workbook into `REFERENCE_EXCEL_TO_BE_LOADED_DIR`.
+  a workbook into `REFERENCE_TO_BE_LOADED_DIR`.
 - **`--- stage: generate TIA report (skipped: no files in INPUT_DIR) ---`**
   — expected when no customer workbooks are present. Drop one into
   `INPUT_DIR` to trigger the per-file primary + TIA loop.
 - **RAG sync repeatedly re-uploads everything** — every reference run
   produces fresh timestamped filenames, so the sync gate detects a
   mismatch and rotates. If you want to avoid the re-upload, don't re-run
-  the reference stage (leave `REFERENCE_EXCEL_TO_BE_LOADED_DIR` empty).
+  the reference stage (leave `REFERENCE_TO_BE_LOADED_DIR` empty).

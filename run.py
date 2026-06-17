@@ -15,7 +15,7 @@ Paths owned by this file (read from .env, must be absolute):
   PROCESSED_DIR          - where successfully converted primary files land
   OUTPUT_REPORT_DIR      - where the generated TIA Markdown report is written
 
-The reference stage env vars (REFERENCE_EXCEL_TO_BE_LOADED_DIR / ...) plus
+The reference stage env vars (REFERENCE_TO_BE_LOADED_DIR / ...) plus
 the AIGateway chat-completions auth (SSC_CLOUD_AIGATEWAY_USER_ID, USE_CASE_ID,
 SSC_CLOUD_AIGATEWAY_BASE_URL) are validated inside reference_info_extractor.py.
 """
