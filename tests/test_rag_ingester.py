@@ -127,43 +127,179 @@ def test_ingest_directory_sync_ok_when_basenames_match(tmp_path: Path) -> None:
     mock_post.assert_not_called()         # NO delete / register / upload
 
 
-def test_ingest_directory_out_of_sync_deletes_then_uploads(tmp_path: Path) -> None:
-    """When local set != RAG set, every existing RAG entry is deleted then
-    each local file is registered+uploaded."""
-    extracted = _make_extracted_dir(tmp_path, ["a.json"])  # 1 local
-    rag_listing = [
-        # 2 stale in RAG — should be deleted
-        {"file_id": "stale-1", "file_name": "old1.json"},
-        {"file_id": "stale-2", "file_name": "old2.json"},
-    ]
-    ing = _make_ingester()
+def _make_sync_post(register_fid: str = "new-fid"):
+    """Returns a (post_calls list, fake_post) pair recording every POST.
 
+    `register` responses always include `register_fid` as the file_id —
+    set a unique value if the test inspects individual results.
+    """
     post_calls: list[tuple] = []
-
-    def fake_get(url, **_):
-        return _FakeResponse(ok=True, status_code=200, json_body=rag_listing)
 
     def fake_post(url, **kwargs):
         post_calls.append((url, kwargs))
-        # Different endpoints return different shapes.
         if url.endswith("/rag/ingest/register"):
-            return _FakeResponse(ok=True, json_body={"file_id": "new-fid-a"})
+            return _FakeResponse(ok=True, json_body={"file_id": register_fid})
         if url.endswith("/rag/ingest/upload"):
             return _FakeResponse(ok=True)
         if url.endswith("/rag/ingest/delete"):
             return _FakeResponse(ok=True)
         return _FakeResponse(ok=False, status_code=500, text="unexpected url")
 
-    with patch("rag_ingester.requests.get", side_effect=fake_get), \
+    return post_calls, fake_post
+
+
+def test_ingest_directory_out_of_sync_set_difference(tmp_path: Path) -> None:
+    """When local set != RAG set, ONLY the diff is acted on: stale entries
+    deleted, new entries uploaded, intersection's file_ids preserved.
+    """
+    extracted = _make_extracted_dir(tmp_path, ["keep.json", "new.json"])
+    rag_listing = [
+        {"file_id": "fid-keep", "file_name": "keep.json"},  # in both → KEEP
+        {"file_id": "stale-1", "file_name": "old1.json"},   # stale → DELETE
+        {"file_id": "stale-2", "file_name": "old2.json"},   # stale → DELETE
+    ]
+    ing = _make_ingester()
+    post_calls, fake_post = _make_sync_post(register_fid="fid-new")
+
+    with patch("rag_ingester.requests.get",
+               return_value=_FakeResponse(ok=True, status_code=200, json_body=rag_listing)), \
          patch("rag_ingester.requests.post", side_effect=fake_post):
         result = ing.ingest_directory(extracted)
 
-    assert result == {"a.json": "new-fid-a"}
-    # 2 deletes + 1 register + 1 upload = 4 POSTs
+    assert result == {"keep.json": "fid-keep", "new.json": "fid-new"}
     posted_urls = [u for u, _ in post_calls]
+    # 2 deletes (stale-1, stale-2) + 1 register + 1 upload (new.json)
     assert posted_urls.count("https://example.invalid/rag/ingest/delete") == 2
     assert posted_urls.count("https://example.invalid/rag/ingest/register") == 1
     assert posted_urls.count("https://example.invalid/rag/ingest/upload") == 1
+
+
+def test_ingest_directory_only_new_uploaded_no_deletes(tmp_path: Path) -> None:
+    """Local strictly extends RAG set → no deletes; only new file uploaded."""
+    extracted = _make_extracted_dir(tmp_path, ["a.json", "b.json"])
+    rag_listing = [
+        {"file_id": "fid-a", "file_name": "a.json"},  # already in RAG → KEEP
+    ]
+    ing = _make_ingester()
+    post_calls, fake_post = _make_sync_post(register_fid="fid-b")
+
+    with patch("rag_ingester.requests.get",
+               return_value=_FakeResponse(ok=True, status_code=200, json_body=rag_listing)), \
+         patch("rag_ingester.requests.post", side_effect=fake_post):
+        result = ing.ingest_directory(extracted)
+
+    assert result == {"a.json": "fid-a", "b.json": "fid-b"}
+    posted_urls = [u for u, _ in post_calls]
+    assert posted_urls.count("https://example.invalid/rag/ingest/delete") == 0
+
+
+def test_ingest_directory_only_stale_deleted_no_uploads(tmp_path: Path) -> None:
+    """Local is a strict subset of RAG → no uploads; stale entries deleted."""
+    extracted = _make_extracted_dir(tmp_path, ["keep.json"])
+    rag_listing = [
+        {"file_id": "fid-keep", "file_name": "keep.json"},
+        {"file_id": "stale", "file_name": "stale.json"},
+    ]
+    ing = _make_ingester()
+    post_calls, fake_post = _make_sync_post()
+
+    with patch("rag_ingester.requests.get",
+               return_value=_FakeResponse(ok=True, status_code=200, json_body=rag_listing)), \
+         patch("rag_ingester.requests.post", side_effect=fake_post):
+        result = ing.ingest_directory(extracted)
+
+    assert result == {"keep.json": "fid-keep"}
+    posted_urls = [u for u, _ in post_calls]
+    assert posted_urls.count("https://example.invalid/rag/ingest/delete") == 1
+    assert posted_urls.count("https://example.invalid/rag/ingest/upload") == 0
+
+
+def test_ingest_directory_tag_isolation_ignores_other_use_cases(tmp_path: Path) -> None:
+    """When `tags` is given, RAG entries lacking those tags must be ignored
+    — they should NOT be deleted, and they should NOT count toward the
+    sync-gate basename set even if their basename collides with a local file.
+    """
+    extracted = _make_extracted_dir(tmp_path, ["shared.json"])
+    rag_listing = [
+        # Owned by us (has our tag) — already in RAG → KEEP
+        {"file_id": "fid-shared",  "file_name": "shared.json",
+         "tags": ["tia_reference"]},
+        # Different use case — must be ignored entirely
+        {"file_id": "fid-foreign", "file_name": "foreign.json",
+         "tags": ["other_use_case"]},
+        # No tags at all — also outside our scope
+        {"file_id": "fid-untagged", "file_name": "untagged.json"},
+    ]
+    ing = _make_ingester()
+    post_calls, fake_post = _make_sync_post()
+
+    with patch("rag_ingester.requests.get",
+               return_value=_FakeResponse(ok=True, status_code=200, json_body=rag_listing)), \
+         patch("rag_ingester.requests.post", side_effect=fake_post):
+        result = ing.ingest_directory(extracted, tags=["tia_reference"])
+
+    # Result includes only the entry we own.
+    assert result == {"shared.json": "fid-shared"}
+    # CRITICAL: no deletes against the other use case's entries.
+    posted_urls = [u for u, _ in post_calls]
+    assert posted_urls.count("https://example.invalid/rag/ingest/delete") == 0
+
+
+def test_entry_has_tags_helper() -> None:
+    has = RagIngester._entry_has_tags
+    # No filter → always True
+    assert has({"tags": ["x"]}, None) is True
+    assert has({}, None) is True
+    assert has({}, []) is True
+    # Subset semantics
+    assert has({"tags": ["a", "b"]}, ["a"]) is True
+    assert has({"tags": ["a", "b"]}, ["a", "b"]) is True
+    assert has({"tags": ["a"]}, ["a", "b"]) is False
+    # Missing or wrong type
+    assert has({}, ["a"]) is False
+    assert has({"tags": None}, ["a"]) is False
+    assert has({"tags": "a"}, ["a"]) is False  # not a list
+
+
+def test_extract_chunk_count_reads_known_fields() -> None:
+    extract = RagIngester._extract_chunk_count
+    assert extract(_FakeResponse(json_body={"num_chunks": 42})) == 42
+    assert extract(_FakeResponse(json_body={"chunk_count": 7})) == 7
+    assert extract(_FakeResponse(json_body={"n_chunks": 3})) == 3
+    assert extract(_FakeResponse(json_body={"chunks": [1, 2, 3, 4]})) == 4
+    # Absent / non-int / non-dict / non-JSON / bool → None
+    assert extract(_FakeResponse(json_body={"file_id": "x"})) is None
+    assert extract(_FakeResponse(json_body={"num_chunks": "lots"})) is None
+    assert extract(_FakeResponse(json_body={"num_chunks": True})) is None
+    assert extract(_FakeResponse(json_body=["not", "a", "dict"])) is None
+    assert extract(_FakeResponse(json_body=None)) is None  # .json() raises
+
+
+def test_upload_logs_num_chunks_when_present(tmp_path: Path, caplog) -> None:
+    """_upload_one_shot logs the chunk count when the gateway returns it."""
+    import logging
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(b"%PDF-1.4 fake")
+    ing = _make_ingester()
+    resp = _FakeResponse(ok=True, status_code=200, json_body={"num_chunks": 128})
+    with patch("rag_ingester.requests.post", return_value=resp):
+        with caplog.at_level(logging.INFO):
+            ing._upload_one_shot("fid-1", f)
+    assert any("num_chunks=128" in r.message for r in caplog.records)
+
+
+def test_upload_ok_without_chunk_count(tmp_path: Path, caplog) -> None:
+    """No chunk field → plain OK line, no crash."""
+    import logging
+    f = tmp_path / "doc.pdf"
+    f.write_bytes(b"%PDF-1.4 fake")
+    ing = _make_ingester()
+    resp = _FakeResponse(ok=True, status_code=200, json_body={"file_id": "fid-1"})
+    with patch("rag_ingester.requests.post", return_value=resp):
+        with caplog.at_level(logging.INFO):
+            ing._upload_one_shot("fid-1", f)
+    assert any("RAG upload OK" in r.message for r in caplog.records)
+    assert not any("num_chunks" in r.message for r in caplog.records)
 
 
 def test_ingest_directory_empty_returns_empty_dict(tmp_path: Path) -> None:
@@ -185,6 +321,33 @@ def test_ingest_directory_missing_dir_raises(tmp_path: Path) -> None:
     ing = _make_ingester()
     with pytest.raises(FileNotFoundError):
         ing.ingest_directory(tmp_path / "does_not_exist")
+
+
+def test_ingest_directory_extras_fold_into_basename_set(tmp_path: Path) -> None:
+    """`extra_files` should be merged with glob_pattern matches when the
+    sync gate compares against the RAG inventory."""
+    extracted = _make_extracted_dir(tmp_path, ["a.json"])
+    # The "extra" file lives in a separate dir but should be considered
+    # part of the local set.
+    pdf_dir = tmp_path / "pdfs"
+    pdf_dir.mkdir()
+    pdf = pdf_dir / "guide.pdf"
+    pdf.write_bytes(b"%PDF-1.4 fake")
+
+    rag_listing = [
+        {"file_id": "fid-a", "file_name": r"X:\old\a.json"},
+        {"file_id": "fid-p", "file_name": r"X:\old\guide.pdf"},
+    ]
+    ing = _make_ingester()
+
+    with patch("rag_ingester.requests.get") as mock_get, \
+         patch("rag_ingester.requests.post") as mock_post:
+        mock_get.return_value = _FakeResponse(ok=True, status_code=200, json_body=rag_listing)
+        result = ing.ingest_directory(extracted, extra_files=[pdf])
+
+    # Set equality holds across both sources → skip upload.
+    assert set(result.keys()) == {"a.json", "guide.pdf"}
+    mock_post.assert_not_called()
 
 
 def test_list_files_raises_on_non_2xx(tmp_path: Path) -> None:

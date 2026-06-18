@@ -1,18 +1,21 @@
 """Per-sheet TIA-relevant extraction from REFERENCE_JSON_DIR.
 
-For each *.json file in reference_json_dir, ask the LLM to extract only the
-facts relevant to a Technical Infrastructure Assessment (TIA), dropping
-instructions/changelogs/templates/blanks/intra-sheet duplicates. Each
-non-empty extraction is written as `extracted_{sheet}_{YYYYMMDD_HHMMSS}.json`
-to extracted_dir (the dir is wiped at the start of each `combine()` call so
-it only ever holds the current run's output).
+For each `<workbook_stem>__<sheet>.json` file in reference_json_dir, ask the
+LLM to extract only the facts relevant to a Technical Infrastructure
+Assessment (TIA), dropping instructions/changelogs/templates/blanks/
+intra-sheet duplicates. Each non-empty extraction is written as
+`extracted_{sheet}_{YYYYMMDD_HHMMSS}.json` back into the same
+reference_json_dir. Source files and extraction files coexist in that dir
+and are distinguished by the `extracted_` prefix; only `extracted_*.json`
+files are wiped at the start of each `combine()` call (the source per-sheet
+JSONs the converter just wrote are preserved).
 
 (The previous pass-2 LLM merge into a single consolidated JSON has been
 removed — downstream consumers now use the RAG service to query the
 extracted artifacts. See `rag_ingester.py`.)
 
 The HTTP call POSTs an OpenAI-compatible chat-completions body to
-{SSC_CLOUD_AIGATEWAY_BASE_URL}/chat/completions. user_id and use_case_id are
+{SSC_CLOUD_AIGATEWAY_BASE_URL}/v1/chat/completions. user_id and use_case_id are
 passed as custom headers.
 """
 
@@ -75,7 +78,6 @@ class ReferenceJsonCombiner:
         use_case_id: str,
         model: str,
         reference_json_dir: Path,
-        extracted_dir: Path,
         timeout_seconds: float = 600.0,
     ) -> None:
         self.api_url = api_url.rstrip("/")
@@ -84,7 +86,6 @@ class ReferenceJsonCombiner:
         self.use_case_id = use_case_id
         self.model = model
         self.reference_json_dir = reference_json_dir
-        self.extracted_dir = extracted_dir
         self.timeout_seconds = timeout_seconds
 
     # ---- public ----
@@ -104,15 +105,18 @@ class ReferenceJsonCombiner:
             logger.error("No .json files found in %s", self.reference_json_dir)
             return 1
 
-        self.extracted_dir.mkdir(parents=True, exist_ok=True)
-        # Wipe top-level files so the dir only ever reflects the current run's
-        # output. (Matches the clean_output_first pattern used elsewhere.)
+        # Selective wipe: only delete previous-run extractions
+        # (`extracted_*.json`). The source per-sheet JSONs the converter
+        # just wrote share this dir and must be preserved.
         wiped = 0
-        for p in self.extracted_dir.iterdir():
+        for p in self.reference_json_dir.glob("extracted_*.json"):
             if p.is_file():
                 p.unlink()
                 wiped += 1
-        logger.info("wiped %d file(s) from %s", wiped, self.extracted_dir)
+        logger.info(
+            "wiped %d previous extracted_*.json file(s) from %s",
+            wiped, self.reference_json_dir,
+        )
         logger.info("combine() starting: %d source file(s)", len(json_files))
 
         non_empty = 0
@@ -141,7 +145,7 @@ class ReferenceJsonCombiner:
             if extracted:
                 non_empty += 1
                 ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                per_sheet_path = self.extracted_dir / f"extracted_{sheet_name}_{ts}.json"
+                per_sheet_path = self.reference_json_dir / f"extracted_{sheet_name}_{ts}.json"
                 with per_sheet_path.open("w", encoding="utf-8") as f:
                     json.dump(extracted, f, ensure_ascii=False, indent=2)
                 logger.info(
@@ -153,7 +157,7 @@ class ReferenceJsonCombiner:
 
         logger.info(
             "combine() finished: %d non-empty extraction(s) written to %s",
-            non_empty, self.extracted_dir,
+            non_empty, self.reference_json_dir,
         )
         return 0
 
@@ -187,10 +191,10 @@ class ReferenceJsonCombiner:
         max_tokens: int,
         label: str,
     ) -> dict[str, Any]:
-        # api_url is the base (e.g. https://api-ai.ssnc.cloud/v1). The gateway
-        # requires the OpenAI-style /chat/completions path; POSTing to bare /v1
-        # returns HTTP 404 "Unsupported path".
-        url = f"{self.api_url}/chat/completions"
+        # api_url is the gateway root (e.g. https://api-ai.ssnc.cloud). The
+        # OpenAI-compatible chat-completions endpoint lives at /v1/chat/completions;
+        # the RAG endpoints live at /rag/... under the same root.
+        url = f"{self.api_url}/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",

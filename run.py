@@ -39,6 +39,7 @@ from excel_to_json import ExcelToJsonConverter
 from logging_setup import bootstrap
 from rag_ingester import RagIngester, RagGatewayError
 from reference_info_extractor import extract as extract_reference_info_stage
+from reference_passthrough_ingester import ingest as ingest_reference_passthrough_stage
 from tia_generator import TiaReportGenerator, TiaGenerationError
 
 
@@ -47,9 +48,9 @@ REQUIRED_VARS = (
     "INTERMEDIATE_JSON_DIR",
     "PROCESSING_DIR",
     "PROCESSED_DIR",
-    "REFERENCE_JSON_EXTRACTED_DIR",
+    "REFERENCE_JSON_DIR",
     "OUTPUT_REPORT_DIR",
-    "SSC_CLOUD_RAG_BASE_URL",
+    "SSC_CLOUD_AIGATEWAY_BASE_URL",
     "SSC_CLOUD_AIGATEWAY_API_KEY",
     "SSC_CLOUD_AIGATEWAY_MODEL",
     "LOG_DIR",
@@ -87,22 +88,38 @@ def main() -> int:
     logger.info("--- stage: extract reference info ---")
     rc_ref = extract_reference_info_stage()
 
-    # RAG sync stage: ensure the RAG store mirrors REFERENCE_JSON_EXTRACTED_DIR.
-    # The ingester's internal sync gate makes this a near-no-op when local
-    # and RAG already match (one listfiles call, no register/upload/delete).
-    # When they differ (e.g., the reference stage just produced new
-    # timestamped files), it deletes the stale RAG entries and re-uploads.
+    # Construct the RAG ingester once and share it across the passthrough
+    # and sync stages — both hit /rag/* with the same auth.
+    rag = RagIngester(
+        base_url=os.environ["SSC_CLOUD_AIGATEWAY_BASE_URL"],
+        api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
+        llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
+    )
+
+    # Passthrough stage: non-Excel reference files (PDFs etc.) get
+    # uploaded directly to RAG and moved to REFERENCE_LOADED_DIR. They
+    # don't go through the Excel-only extraction pipeline.
+    logger.info("--- stage: ingest reference passthrough ---")
+    rc_passthrough = ingest_reference_passthrough_stage(rag)
+
+    # RAG sync stage: ensure the RAG store mirrors the union of
+    # `extracted_*.json` in REFERENCE_JSON_DIR and passthrough files
+    # already in REFERENCE_LOADED_DIR (e.g. *.pdf). The ingester's
+    # internal sync gate makes this a near-no-op when local and RAG
+    # already match. When they differ, it deletes the stale RAG entries
+    # and re-uploads from scratch.
     logger.info("--- stage: sync RAG with reference extractions ---")
     rc_rag = 0
     try:
-        rag = RagIngester(
-            base_url=os.environ["SSC_CLOUD_RAG_BASE_URL"],
-            api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
-            llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
-        )
+        loaded_dir = Path(os.environ["REFERENCE_LOADED_DIR"])
+        loaded_passthrough = sorted(
+            p for pat in ("*.pdf",) for p in loaded_dir.glob(pat)
+        ) if loaded_dir.is_dir() else []
         rag.ingest_directory(
-            Path(os.environ["REFERENCE_JSON_EXTRACTED_DIR"]),
+            Path(os.environ["REFERENCE_JSON_DIR"]),
             tags=["tia_reference"],
+            glob_pattern="extracted_*.json",
+            extra_files=loaded_passthrough,
         )
     except (
         RagGatewayError,
@@ -112,8 +129,8 @@ def main() -> int:
         logger.error("RAG sync FAILED: %s", exc)
         rc_rag = 1
     except FileNotFoundError as exc:
-        # REFERENCE_JSON_EXTRACTED_DIR doesn't exist yet (no reference has
-        # been processed). Not fatal — the TIA stage will fail visibly if it
+        # REFERENCE_JSON_DIR doesn't exist yet (no reference has been
+        # processed). Not fatal — the TIA stage will fail visibly if it
         # tries to use empty RAG state.
         logger.warning("RAG sync skipped: %s", exc)
 
@@ -130,7 +147,7 @@ def main() -> int:
         logger.info("--- stage: primary + TIA (skipped: no files in INPUT_DIR) ---")
     else:
         tia = TiaReportGenerator(
-            base_url=os.environ["SSC_CLOUD_RAG_BASE_URL"],
+            base_url=os.environ["SSC_CLOUD_AIGATEWAY_BASE_URL"],
             api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
             llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
             output_dir=Path(os.environ["OUTPUT_REPORT_DIR"]),
@@ -166,6 +183,14 @@ def main() -> int:
             ) as exc:
                 logger.error("TIA failed for %s: %s", xlsx.name, exc)
                 rc_tia = 1
+                # Keep the source xlsx in PROCESSING_DIR so the operator can
+                # retry on the next scheduled run, instead of graduating it
+                # to PROCESSED_DIR with no corresponding TIA report.
+                primary.unmark_processed(xlsx.name)
+                logger.info(
+                    "left %s in PROCESSING_DIR for retry (TIA failed)",
+                    xlsx.name,
+                )
 
     # End-of-run finalize: move successfully-converted primary source files
     # from PROCESSING_DIR to PROCESSED_DIR. Files whose conversion failed
@@ -176,7 +201,7 @@ def main() -> int:
         moved, primary.processed_dir,
     )
 
-    exit_code = rc_ref or rc_rag or rc_primary or rc_tia
+    exit_code = rc_ref or rc_passthrough or rc_rag or rc_primary or rc_tia
     logger.info("=== run.py end (exit=%d) ===", exit_code)
     return exit_code
 

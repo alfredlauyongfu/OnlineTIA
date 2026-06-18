@@ -23,6 +23,10 @@ def test_import_reference_info_extractor() -> None:
     import reference_info_extractor  # noqa: F401
 
 
+def test_import_reference_passthrough_ingester() -> None:
+    import reference_passthrough_ingester  # noqa: F401
+
+
 def test_import_rag_ingester() -> None:
     import rag_ingester  # noqa: F401
 
@@ -40,10 +44,12 @@ def test_required_vars_all_include_log_dir() -> None:
     tuple must include it, else logging-config will KeyError at runtime."""
     import run
     import reference_info_extractor
+    import reference_passthrough_ingester
     import rag_ingester
     import tia_generator
 
     assert "LOG_DIR" in run.REQUIRED_VARS
     assert "LOG_DIR" in reference_info_extractor.REQUIRED_ENV_VARS
+    assert "LOG_DIR" in reference_passthrough_ingester.REQUIRED_ENV_VARS
     assert "LOG_DIR" in rag_ingester.REQUIRED_ENV_VARS
     assert "LOG_DIR" in tia_generator.REQUIRED_ENV_VARS

@@ -9,8 +9,9 @@ Each file goes through two HTTP POSTs against the AI Gateway RAG API:
 Auth is via the `X-API-Key` header (reuses SSC_CLOUD_AIGATEWAY_API_KEY).
 
 This module is standalone — instantiating callers wire `RagIngester` in
-themselves. A bottom-of-file `main()` test harness lets you ingest every file
-in REFERENCE_JSON_EXTRACTED_DIR with `python online_tia\rag_ingester.py`.
+themselves. A bottom-of-file `main()` test harness lets you ingest every
+`extracted_*.json` file in REFERENCE_JSON_DIR with
+`python online_tia\rag_ingester.py`.
 """
 
 from __future__ import annotations
@@ -132,57 +133,92 @@ class RagIngester:
         tags: list[str] | None = None,
         rag_config_overrides: dict[str, Any] | None = None,
         force_update: bool = True,
+        extra_files: list[Path] | None = None,
     ) -> dict[str, str]:
         """Ingest every matching file in dir_path. Returns {filename: file_id}.
 
         Per-file failures are logged and skipped — the run continues for the
         remaining files. A connection-level failure (gateway unreachable) is
         raised so the caller can abort instead of looping uselessly.
+
+        `extra_files` (if given) are merged into the local file set for the
+        basename-equality sync gate AND uploaded alongside the glob matches
+        when a mismatch triggers re-upload. Use this when files outside
+        `dir_path` should be considered part of the same RAG-managed set
+        (e.g. PDFs already moved to REFERENCE_LOADED_DIR).
+
+        Sync gate behaviour (set-difference):
+          - The RAG inventory is filtered to entries carrying ALL of the
+            requested `tags` (if any) so this pipeline only touches the
+            files it owns. Other use-cases sharing the same gateway are
+            invisible to the gate.
+          - Stale entries (in RAG, not local) are deleted.
+          - New files (local, not in RAG) are uploaded.
+          - Files in both sides keep their existing `file_id`.
         """
         if not dir_path.is_dir():
             raise FileNotFoundError(f"Directory not found: {dir_path}")
 
-        files = sorted(dir_path.glob(glob_pattern))
+        files = sorted(set(dir_path.glob(glob_pattern)) | set(extra_files or []))
         if not files:
             logger.warning("No files match %s in %s", glob_pattern, dir_path)
             return {}
 
-        # Sync gate: compare local basenames against what's already in RAG.
-        # If they're identical, skip the upload entirely (idempotent re-run).
-        # Otherwise wipe RAG and re-upload from scratch.
+        # Sync gate: compare local basenames against what's already in RAG
+        # under our tag set. Set-difference yields the minimal delete/upload
+        # work; intersection keeps its existing file_id.
         rag_entries = self.list_files()
         if not isinstance(rag_entries, list):
             rag_entries = []
-        local_names = {p.name for p in files}
-        rag_names = {
-            Path(e["file_name"]).name
-            for e in rag_entries
-            if isinstance(e, dict) and e.get("file_name")
-        }
 
-        if local_names == rag_names:
+        # Tag isolation: only consider RAG entries that carry all of our
+        # requested tags. With `tags=None`, no filtering happens (matches
+        # the legacy behaviour for callers that genuinely want the full
+        # inventory).
+        owned_entries: list[dict] = [
+            e for e in rag_entries
+            if isinstance(e, dict)
+            and e.get("file_name")
+            and e.get("file_id")
+            and self._entry_has_tags(e, tags)
+        ]
+
+        # basename -> file_id for our owned RAG entries. If duplicates exist
+        # (shouldn't, but defend against it) the last one wins; the others
+        # become stale during the set-difference pass below.
+        rag_by_name: dict[str, str] = {
+            Path(e["file_name"]).name: e["file_id"] for e in owned_entries
+        }
+        local_by_name: dict[str, Path] = {p.name: p for p in files}
+
+        local_names = set(local_by_name)
+        rag_names = set(rag_by_name)
+
+        to_delete = rag_names - local_names
+        to_upload = local_names - rag_names
+        unchanged = local_names & rag_names
+
+        if not to_delete and not to_upload:
             logger.info(
                 "RAG sync OK: %d local file(s) match %d uploaded file(s); skipping upload",
                 len(local_names), len(rag_names),
             )
-            return {
-                Path(e["file_name"]).name: e["file_id"]
-                for e in rag_entries
-                if isinstance(e, dict)
-                and e.get("file_name")
-                and e.get("file_id")
-                and Path(e["file_name"]).name in local_names
-            }
+            return {name: rag_by_name[name] for name in unchanged}
 
         logger.info(
-            "RAG out of sync (local=%d, uploaded=%d); deleting all uploaded files then re-uploading",
-            len(local_names), len(rag_names),
+            "RAG sync: delete %d stale, upload %d new, keep %d unchanged",
+            len(to_delete), len(to_upload), len(unchanged),
         )
-        for entry in rag_entries:
-            if not isinstance(entry, dict) or not entry.get("file_id"):
-                continue
+
+        # Delete only stale entries — and clean up any extra owned-by-tag
+        # entries that share a basename we're keeping (defensive dedup).
+        stale_file_ids: list[str] = [
+            e["file_id"] for e in owned_entries
+            if Path(e["file_name"]).name in to_delete
+        ]
+        for file_id in stale_file_ids:
             try:
-                self._delete_one(entry["file_id"])
+                self._delete_one(file_id)
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
                 # Gateway dropped mid-delete: stop trying to delete; the
                 # subsequent ingest will also fail fast.
@@ -190,10 +226,13 @@ class RagIngester:
                 raise RagGatewayError(f"Gateway unreachable mid-delete: {exc}") from exc
             except Exception as exc:
                 # Per-file delete failure: log and keep deleting others.
-                logger.error("delete failed for %s: %s", entry.get("file_id"), exc)
+                logger.error("delete failed for %s: %s", file_id, exc)
 
-        results: dict[str, str] = {}
-        for f in files:
+        # Start with the unchanged entries' existing file_ids, then upload
+        # only the new files.
+        results: dict[str, str] = {name: rag_by_name[name] for name in unchanged}
+        for name in sorted(to_upload):
+            f = local_by_name[name]
             try:
                 file_id = self.ingest_file(
                     f,
@@ -208,9 +247,24 @@ class RagIngester:
             except Exception as exc:
                 logger.error("ingest skipped %s: %s", f.name, exc)
                 continue
-            results[f.name] = file_id
+            results[name] = file_id
 
         return results
+
+    @staticmethod
+    def _entry_has_tags(entry: dict, required_tags: list[str] | None) -> bool:
+        """Does `entry` carry every tag in `required_tags`?
+
+        `required_tags=None` means "no filter" → always True (legacy
+        callers and the tag-agnostic `list_files()` consumers keep
+        seeing every entry).
+        """
+        if not required_tags:
+            return True
+        entry_tags = entry.get("tags") or []
+        if not isinstance(entry_tags, list):
+            return False
+        return set(required_tags).issubset(entry_tags)
 
     # ---- internals ----
 
@@ -331,7 +385,38 @@ class RagIngester:
             logger.error("RAG %s FAILED (gateway): %s", label, exc)
             raise
         self._raise_for_status(response, label)
-        logger.info("RAG upload OK: %s (file_id=%s)", file_path.name, file_id)
+        # The gateway chunks + vectorizes during upload processing, so the
+        # chunk count (if reported) appears on THIS response, not on register.
+        num_chunks = self._extract_chunk_count(response)
+        if num_chunks is not None:
+            logger.info(
+                "RAG upload OK: %s (file_id=%s, num_chunks=%s)",
+                file_path.name, file_id, num_chunks,
+            )
+        else:
+            logger.info("RAG upload OK: %s (file_id=%s)", file_path.name, file_id)
+
+    @staticmethod
+    def _extract_chunk_count(response: Any) -> int | None:
+        """Best-effort: pull a chunk count out of a gateway response. The
+        gateway reports it under one of a few possible field names (and only
+        once vectorization has run), so this returns None when absent or when
+        the body isn't JSON."""
+        try:
+            payload = response.json()
+        except (ValueError, AttributeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        for key in ("num_chunks", "chunk_count", "n_chunks", "chunks"):
+            v = payload.get(key)
+            if isinstance(v, bool):  # guard: bools are ints in Python
+                continue
+            if isinstance(v, int):
+                return v
+            if isinstance(v, list):
+                return len(v)
+        return None
 
     def _delete_one(self, file_id: str) -> None:
         """POST /rag/ingest/delete with {'file_id': file_id}.
@@ -347,20 +432,24 @@ class RagIngester:
         )
         logger.info("RAG delete OK: file_id=%s", file_id)
 
+    def delete_file_id(self, file_id: str) -> None:
+        """Public alias for `_delete_one`. Use this from outside the class."""
+        self._delete_one(file_id)
+
 
 # ---- standalone test harness ----
 #
-# Run directly to ingest every *.json file in REFERENCE_JSON_EXTRACTED_DIR:
+# Run directly to ingest every extracted_*.json file in REFERENCE_JSON_DIR:
 #   & C:\blueprism\OnlineTIA\.venv\Scripts\python.exe C:\blueprism\OnlineTIA\online_tia\rag_ingester.py
 #
 # Requires the per-sheet extracted files to already exist (run
 # reference_info_extractor.py first).
 
 REQUIRED_ENV_VARS = (
-    "SSC_CLOUD_RAG_BASE_URL",
+    "SSC_CLOUD_AIGATEWAY_BASE_URL",
     "SSC_CLOUD_AIGATEWAY_API_KEY",
     "SSC_CLOUD_AIGATEWAY_MODEL",
-    "REFERENCE_JSON_EXTRACTED_DIR",
+    "REFERENCE_JSON_DIR",
     "LOG_DIR",
 )
 
@@ -370,23 +459,23 @@ def main() -> int:
     if rc is not None:
         return rc
 
-    extracted_dir = Path(os.environ["REFERENCE_JSON_EXTRACTED_DIR"])
-    if not any(extracted_dir.glob("*.json")):
+    reference_json_dir = Path(os.environ["REFERENCE_JSON_DIR"])
+    if not any(reference_json_dir.glob("extracted_*.json")):
         print(
-            f"No .json files in {extracted_dir}\n"
+            f"No extracted_*.json files in {reference_json_dir}\n"
             f"Run reference_info_extractor.py first to populate it.",
             file=sys.stderr,
         )
         return 1
 
     ingester = RagIngester(
-        base_url=os.environ["SSC_CLOUD_RAG_BASE_URL"],
+        base_url=os.environ["SSC_CLOUD_AIGATEWAY_BASE_URL"],
         api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
         llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
     )
 
     print("=== rag_ingester (standalone test) ===")
-    print(f"  source dir : {extracted_dir}")
+    print(f"  source dir : {reference_json_dir} (extracted_*.json only)")
     print(f"  endpoint   : {ingester.base_url}/rag/ingest/(listfiles|register|upload)")
     print(f"  model      : {ingester.llm_model}")
 
@@ -399,7 +488,11 @@ def main() -> int:
         return 1
 
     try:
-        results = ingester.ingest_directory(extracted_dir, tags=["tia_reference"])
+        results = ingester.ingest_directory(
+            reference_json_dir,
+            tags=["tia_reference"],
+            glob_pattern="extracted_*.json",
+        )
     except RagGatewayError as exc:
         print(f"  ABORTED: {exc}", file=sys.stderr)
         return 1

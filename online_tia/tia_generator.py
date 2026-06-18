@@ -37,25 +37,23 @@ TIA_SYSTEM_PROMPT = """You are a senior infrastructure consultant authoring a Te
 Infrastructure Assessment (TIA) for a customer. Use the customer-provided JSON data
 (their TIA workbook contents, supplied in the user message) together with the
 reference chunks retrieved from the RAG store (TIA standards, scoring guidance,
-recommended configurations). Incorporate the reference material implicitly into
-your assessment and flag any customer answers that violate or fall short of the
+recommended configurations). Incorporate the reference material into your
+assessment and flag any customer answers that violate or fall short of the
 reference recommendations.
 
+The full report is produced ONE SECTION AT A TIME. Each request names the single
+section to write — produce ONLY that section's content.
+
 Output requirements:
-- Markdown ONLY. No preamble. Do not wrap the entire document in a code fence.
-- Suggested top-level sections (omit any that don't apply to the customer's data):
-    # Executive Summary
-    ## Servers (SQL / App / Runtime)
-    ## Interactive Clients
-    ## Disaster Recovery
-    ## Security
-    ## General Environment
-    ## Findings & Recommendations
-    ## Outstanding Questions
+- Markdown ONLY. No preamble, no sign-off, no document title. Do not wrap the
+  output in a code fence.
+- Begin with the exact level-2 heading given for the requested section, then its
+  content. Use level-3 (###) headings for any subsections.
 - Be concrete: name specific systems, versions, counts, hostnames where given.
 - Use bullet lists, short paragraphs, and tables where they aid readability.
-- Where the customer data is missing or ambiguous, list it under
-  "## Outstanding Questions" — do NOT invent values.
+- Do NOT invent values. Where the customer data is missing or ambiguous, say so
+  explicitly within the relevant section.
+- Do not produce content belonging to other sections.
 """
 
 
@@ -66,6 +64,46 @@ class TiaReportGenerator:
     DEFAULT_N_VECTOR_CANDIDATES = 20
     DEFAULT_N_FULLTEXT_CANDIDATES = 20
     DEFAULT_NUM_QUERY_REWRITES = 3
+
+    # The /rag/chat/completions endpoint hard-caps output near ~4096 completion
+    # tokens and ignores every max-token request parameter, so a single-call
+    # full report gets silently truncated mid-content. We therefore generate the
+    # report one section at a time (each section stays well under the cap) and
+    # concatenate. Each section makes its own RAG call, so retrieval is naturally
+    # scoped to that section's topic.
+    REPORT_SECTIONS: tuple[tuple[str, str], ...] = (
+        ("Executive Summary",
+         "Give a concise overview of the environment's scale (Blue Prism version, "
+         "Runtime Resource / App Server / Interactive Client counts, scale tier, "
+         "virtualisation) and the most significant findings as a short bulleted list."),
+        ("Servers (SQL / App / Runtime)",
+         "Assess the Database/SQL Server, Application Servers, and Runtime Resources: "
+         "platform, scale-tier specs, dedication, connection security, backups, "
+         "statistics, index maintenance, encryption-key location, authentication."),
+        ("Interactive Clients",
+         "Assess the Interactive Clients: counts, platform, and any mirroring/build "
+         "differences between development clients and production Runtime Resources."),
+        ("Disaster Recovery",
+         "Assess DR readiness. If no DR data was provided, state that clearly and list "
+         "the DR areas that must be documented for an environment of this scale."),
+        ("Security",
+         "Summarise the security posture as a table (Area, Status, Severity) covering "
+         "SQL connection encryption, encryption-key location, Runtime Resource "
+         "authentication, SQL dedication, and any unanswered security questions."),
+        ("General Environment",
+         "Assess session logging (level, archiving, Data Gateways, Unicode) and the "
+         "process/object estate, relating volume to database-load risk."),
+        ("Findings & Recommendations",
+         "Produce a single prioritised findings table with columns: #, Area, Finding, "
+         "Severity, Recommendation. Order by severity (High first)."),
+        ("Outstanding Questions",
+         "List every customer question that was unanswered, blank, or ambiguous in the "
+         "data, grouped by area. Do NOT invent answers — only list what needs clarifying."),
+    )
+
+    # If a section's completion_tokens lands at/above this, the gateway very
+    # likely truncated it at its ~4096-token ceiling — warn the operator.
+    TRUNCATION_TOKEN_THRESHOLD = 4000
 
     def __init__(
         self,
@@ -99,19 +137,33 @@ class TiaReportGenerator:
             )
 
         logger.info(
-            "TIA generate start: source_dir=%s, files=%d, model=%s, tags=%s",
-            customer_json_dir, len(customer_content), self.llm_model, self.reference_tags,
+            "TIA generate start: source_dir=%s, files=%d, model=%s, tags=%s, sections=%d",
+            customer_json_dir, len(customer_content), self.llm_model,
+            self.reference_tags, len(self.REPORT_SECTIONS),
         )
 
-        user_message = self._build_user_message(customer_content)
-        markdown = self._call_rag_chat(user_message)
+        data_block = self._build_user_message(customer_content)
+
+        # Generate each section in its own RAG call (the endpoint caps output
+        # near ~4096 tokens, so a single all-in-one call truncates).
+        section_texts: list[str] = []
+        for i, (title, hint) in enumerate(self.REPORT_SECTIONS, start=1):
+            logger.info(
+                "TIA section %d/%d: %s", i, len(self.REPORT_SECTIONS), title,
+            )
+            message = data_block + self._section_directive(title, hint)
+            section_md = self._call_rag_chat(message, section=title)
+            section_texts.append(self._strip_code_fence(section_md).strip())
+
+        markdown = self._assemble_report(section_texts)
 
         self.output_dir.mkdir(parents=True, exist_ok=True)
         out_path = self._build_output_path(filename_prefix)
         with out_path.open("w", encoding="utf-8") as f:
             f.write(markdown)
         logger.info(
-            "TIA written: %s (%d bytes)", out_path, out_path.stat().st_size
+            "TIA written: %s (%d bytes, %d sections)",
+            out_path, out_path.stat().st_size, len(section_texts),
         )
         return out_path
 
@@ -137,7 +189,42 @@ class TiaReportGenerator:
             f"```json\n{body}\n```\n"
         )
 
-    def _call_rag_chat(self, user_message: str) -> str:
+    @staticmethod
+    def _section_directive(title: str, hint: str) -> str:
+        """The per-section instruction appended to the shared data block. Tells
+        the model to produce ONLY the named section, starting with its heading."""
+        return (
+            f"\nWrite ONLY the \"{title}\" section of the assessment. "
+            f"Begin with this exact heading line:\n\n## {title}\n\n{hint}\n"
+        )
+
+    @staticmethod
+    def _assemble_report(section_texts: list[str]) -> str:
+        """Join the per-section Markdown into one document with a title header
+        and horizontal rules between sections."""
+        title = (
+            "# Technical Infrastructure Assessment\n"
+            "### Blue Prism Enterprise — Customer Environment\n"
+        )
+        return title + "\n---\n\n" + "\n\n---\n\n".join(section_texts) + "\n"
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """Defensive: if the model wrapped a whole section in a ```markdown / ```
+        fence despite instructions, unwrap it. Leaves inner fenced code blocks
+        (which don't start at the very first line) untouched."""
+        s = text.strip()
+        if not s.startswith("```"):
+            return text
+        lines = s.splitlines()
+        # Drop the opening fence line (``` or ```markdown).
+        lines = lines[1:]
+        # Drop a trailing closing fence if present.
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        return "\n".join(lines)
+
+    def _call_rag_chat(self, user_message: str, section: str | None = None) -> str:
         url = f"{self.base_url}/rag/chat/completions"
         headers = {
             "Content-Type": "application/json",
@@ -158,7 +245,8 @@ class TiaReportGenerator:
             ],
         }
 
-        logger.info("TIA LLM call start: input_chars=%d", len(user_message))
+        label = f" [{section}]" if section else ""
+        logger.info("TIA LLM call start%s: input_chars=%d", label, len(user_message))
 
         try:
             response = requests.post(
@@ -196,10 +284,26 @@ class TiaReportGenerator:
             )
 
         citations = payload.get("rag_citations") or []
+        completion_tokens = (payload.get("llm_usage") or {}).get("completion_tokens")
         logger.info(
-            "TIA LLM call OK: output_chars=%d, citations=%d",
-            len(content), len(citations) if isinstance(citations, list) else 0,
+            "TIA LLM call OK%s: output_chars=%d, completion_tokens=%s, citations=%d",
+            label, len(content), completion_tokens,
+            len(citations) if isinstance(citations, list) else 0,
         )
+
+        # Truncation guardrail: the /rag/chat/completions endpoint silently caps
+        # output near ~4096 completion tokens and ignores max-token request
+        # params. If we land at/above the threshold, the section was very likely
+        # cut off — surface it so an operator notices an incomplete report.
+        if (
+            isinstance(completion_tokens, int)
+            and completion_tokens >= self.TRUNCATION_TOKEN_THRESHOLD
+        ):
+            logger.warning(
+                "TIA output may be TRUNCATED%s: completion_tokens=%d is at/near the "
+                "gateway's ~4096-token cap; content likely cut off mid-section.",
+                label, completion_tokens,
+            )
         if isinstance(citations, list):
             # Per-citation summary line (quick scan).
             for c in citations:
@@ -237,7 +341,7 @@ class TiaReportGenerator:
 # TiaReportGenerator class itself stays directory-agnostic.
 
 REQUIRED_ENV_VARS = (
-    "SSC_CLOUD_RAG_BASE_URL",
+    "SSC_CLOUD_AIGATEWAY_BASE_URL",
     "SSC_CLOUD_AIGATEWAY_API_KEY",
     "SSC_CLOUD_AIGATEWAY_MODEL",
     "OUTPUT_REPORT_DIR",
@@ -261,7 +365,7 @@ def main() -> int:
         return 1
 
     gen = TiaReportGenerator(
-        base_url=os.environ["SSC_CLOUD_RAG_BASE_URL"],
+        base_url=os.environ["SSC_CLOUD_AIGATEWAY_BASE_URL"],
         api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
         llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
         output_dir=Path(os.environ["OUTPUT_REPORT_DIR"]),

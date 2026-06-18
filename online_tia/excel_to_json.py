@@ -19,6 +19,7 @@ import datetime as dt
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -90,8 +91,9 @@ class ExcelToJsonConverter:
             source = self.processing_dir / xlsx.name
             # When processing_dir == input_dir, source == xlsx and the rename
             # would be a no-op (or platform-dependent error). Skip it.
+            # shutil.move handles cross-volume falls back to copy+unlink.
             if source != xlsx:
-                xlsx.replace(source)
+                shutil.move(str(xlsx), str(source))
         else:
             source = xlsx
 
@@ -148,6 +150,24 @@ class ExcelToJsonConverter:
 
         return 0
 
+    def unmark_processed(self, name: str) -> int:
+        """Remove every entry from `successfully_processed_paths` whose
+        basename matches `name`. Returns the count removed.
+
+        Use when a downstream stage (e.g. TIA generation) failed for this
+        file so it should NOT graduate to processed_dir at finalize time —
+        leaving it in processing_dir lets the operator retry on the next
+        scheduled run. No-op if the converter wasn't configured to move
+        sources.
+        """
+        if not self._moves_sources:
+            return 0
+        before = len(self.successfully_processed_paths)
+        self.successfully_processed_paths = [
+            p for p in self.successfully_processed_paths if p.name != name
+        ]
+        return before - len(self.successfully_processed_paths)
+
     def finalize_to_processed_dir(self) -> int:
         """Move every file recorded in `successfully_processed_paths` from
         processing_dir to processed_dir. Returns the number of files moved.
@@ -170,7 +190,12 @@ class ExcelToJsonConverter:
                 continue
             target = self.processed_dir / src.name
             try:
-                src.replace(target)
+                # shutil.move handles cross-volume fallback to copy+unlink.
+                # Delete a stale target first so the fallback won't refuse
+                # to overwrite.
+                if target.exists():
+                    target.unlink()
+                shutil.move(str(src), str(target))
             except Exception as exc:
                 logger.error("finalize FAILED for %s: %s", src.name, exc)
                 continue

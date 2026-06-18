@@ -1,35 +1,51 @@
 # OnlineTIA
 
 A Python pipeline that turns Blue Prism **Technical Infrastructure Assessment
-(TIA)** Excel workbooks into Markdown assessment reports. It (1) extracts the
-sheets of a customer TIA workbook into JSON, (2) calls an LLM to distil a
-reference TIA workbook's sheets into a smaller per-topic knowledge set, (3)
-ingests that knowledge into a Retrieval-Augmented Generation (RAG) store, then
-(4) generates a per-customer assessment report grounded in both the customer's
-own data and the RAG-retrieved reference recommendations.
+(TIA)** customer responses into Markdown assessment reports. It maintains a
+RAG knowledge base populated from two kinds of reference materials —
+**TIA reference workbooks** (Excel, sheet-by-sheet LLM-distilled before
+upload) and **passthrough documents** (PDFs and similar, uploaded directly
+without conversion) — then, for each customer response workbook, runs a
+RAG-grounded LLM call that combines the customer's data with the most
+relevant reference chunks and writes the resulting TIA report to disk.
 
 ## Architecture / data flow
 
-`run.py` runs four stages in this order on every invocation:
+`run.py` runs **four stages** in this order on every invocation:
 
 ```
                   ┌─────────────────────────────┐
-                  │ 1. extract reference info   │  (idempotent: skipped if inbox empty)
-                  │                             │
+                  │ 1. extract reference info   │   (xlsx/xlsm only;
+                  │                             │    skipped if inbox has none)
                   │  REFERENCE_TO_BE_LOADED_DIR │
    ReferenceTo  ──┤        ▶ convert ▶          ├─►  REFERENCE_JSON_DIR
-   BeLoaded ─►    │        │                    │     │
-                  │        │ on success         │     ▼ LLM per-sheet extract
-                  │        ▼                    │     │
-                  │  REFERENCE_LOADED_DIR       │     ▼
-                  │                             │  REFERENCE_JSON_EXTRACTED_DIR
-                  └─────────────────────────────┘     │
+   BeLoaded ─►    │        │                    │     │   • source per-sheet:
+                  │        │ on success         │     │     <workbook>__<sheet>.json
+                  │        ▼                    │     │   • LLM extractions:
+                  │  REFERENCE_LOADED_DIR ◄─┐   │     │     extracted_<sheet>_<ts>.json
+                  └─────────────────────────┼───┘     │     (written back in-place)
+                                            │        │
+                  ┌─────────────────────────────┐    │
+                  │ 1.5 reference passthrough   │    │
+                  │                             │    │
+                  │  REFERENCE_TO_BE_LOADED_DIR │    │
+   PDF (etc.) ──► │     matched by              │    │
+                  │     PASSTHROUGH_PATTERNS    │    │
+                  │        ▶ RAG.ingest_file ▶  │    │
+                  │        │ (overwrite-aware)  │    │
+                  │        ▼                    │    │
+                  │  REFERENCE_LOADED_DIR ──────┘    │
+                  └─────────────────────────────┘    │
                                                      │
                   ┌─────────────────────────────┐    │
                   │ 2. sync RAG with reference  │ ◄──┘
                   │                             │
-                  │  basenames match RAG? ──► skip
-                  │  otherwise ──► delete-all + upload-all (POST /rag/ingest/...)
+                  │   local set = extracted_*.json ∪ LOADED *.pdf
+                  │   RAG set  = entries tagged "tia_reference" only
+                  │   set-difference:
+                  │     delete stale (in RAG, not local)
+                  │     upload  new   (local, not in RAG)
+                  │     keep    same  (in both)
                   └─────────────────────────────┘
 
                   ┌─────────────────────────────┐
@@ -38,15 +54,40 @@ own data and the RAG-retrieved reference recommendations.
    INPUT_DIR ─►───┤  for each xlsx:             │
    (customer)     │    wipe INTERMEDIATE        │
                   │    convert ──► INTERMEDIATE_JSON_DIR (one file's sheets only)
-                  │    LLM /rag/chat/completions with tags=["tia_reference"]
+                  │    section-by-section LLM /rag/chat/completions
+                  │      (tags=["tia_reference"]; ~8 calls, one per report section)
                   │    write TIA_<stem>_<ts>.md to OUTPUT_REPORT_DIR
-                  │  finalize: PROCESSING ──► PROCESSED for converted xlsx
+                  │  finalize: PROCESSING ──► PROCESSED (only if TIA succeeded)
                   └─────────────────────────────┘
 ```
+
+`REFERENCE_LOADED_DIR` now holds **both** kinds of successfully-ingested
+reference materials — graduated xlsx (from stage 1) and passthrough files
+like PDFs (from stage 1.5). The stage-2 sync gate scans the union of
+LLM-extracted JSONs (in `REFERENCE_JSON_DIR`) and passthrough files (in
+`REFERENCE_LOADED_DIR`) so RAG stays consistent with the local source of
+truth.
 
 Each customer file is processed **independently and sequentially** — the
 intermediate JSON store never holds more than one file's content at a time,
 and each TIA report is based on exactly one input file.
+
+## Supported reference file types
+
+| Extension | Lifecycle | Module |
+|-----------|-----------|--------|
+| `.xlsx`, `.xlsm` | **Extraction**: Excel → per-sheet JSON → LLM-distilled `extracted_*.json` → RAG upload via the sync gate. Source workbook moves to `REFERENCE_LOADED_DIR` after successful conversion. | `reference_info_extractor.py` |
+| `.pdf` | **Passthrough**: uploaded as-is to RAG (no client-side parsing — the gateway handles chunking/vectorization). Source PDF moves to `REFERENCE_LOADED_DIR` after successful upload. | `reference_passthrough_ingester.py` |
+
+The passthrough patterns are configured in
+`online_tia/reference_passthrough_ingester.py`:
+
+```python
+PASSTHROUGH_PATTERNS: tuple[str, ...] = ("*.pdf",)
+```
+
+Adding more passthrough types (e.g. `.docx`, `.txt`) is a one-line change
+— append the glob to the tuple. The upload path is content-agnostic.
 
 ## Modules
 
@@ -57,25 +98,27 @@ only Python file at the project root.
 |------|-------------|
 | `run.py` | CLI entry point. Runs all four stages in the order above. |
 | `online_tia/reference_info_extractor.py` | Stage 1 orchestrator: reference Excel → JSON → LLM-extracted JSON. |
+| `online_tia/reference_passthrough_ingester.py` | Stage 1.5 orchestrator: glob non-Excel patterns in the inbox → direct RAG upload (overwrite-aware) → move to LOADED. |
 | `online_tia/excel_to_json.py` | `ExcelToJsonConverter` — Excel→JSON conversion + claim/processed move lifecycle. |
 | `online_tia/reference_json_combiner.py` | `ReferenceJsonCombiner` — per-sheet LLM extraction via `/v1/chat/completions`. |
-| `online_tia/rag_ingester.py` | `RagIngester` — list/register/upload/delete against `/rag/ingest/*`, with sync gate. |
-| `online_tia/tia_generator.py` | `TiaReportGenerator` — generates the Markdown TIA via `/rag/chat/completions`. |
+| `online_tia/rag_ingester.py` | `RagIngester` — list/register/upload/delete against `/rag/ingest/*`, with basename-equality sync gate (now supports `extra_files` for cross-dir local sets). |
+| `online_tia/tia_generator.py` | `TiaReportGenerator` — generates the Markdown TIA via `/rag/chat/completions`, **one section at a time** (the endpoint hard-caps output near ~4096 tokens, so a single all-in-one call truncates), then concatenates. Warns if any section nears the cap. |
 | `online_tia/logging_setup.py` | `configure_logging` + `bootstrap` (.env load + required-var check + logging). |
 
-Three of the modules (`reference_info_extractor.py`, `rag_ingester.py`,
-`tia_generator.py`) can also be invoked as standalone harnesses for testing
-individual stages — each has a `main()` and `if __name__ == "__main__":`
-block at the bottom.
+Four of the modules (`reference_info_extractor.py`,
+`reference_passthrough_ingester.py`, `rag_ingester.py`,
+`tia_generator.py`) can also be invoked as standalone harnesses for
+testing individual stages — each has its own `bootstrap()` call and
+`if __name__ == "__main__":` block at the bottom.
 
 ## Prerequisites
 
 - **Python 3.10+** (uses PEP 604 `int | str` annotations).
 - **Network access** to:
   - `api-ai.ssnc.cloud` (chat-completions endpoint, used by the reference
-    extraction stage).
-  - `api-ai-us.ssnc-corp.cloud` (RAG endpoints, used by RAG sync + TIA
-    generation stages).
+    extraction stage and customer TIA generation).
+  - `api-ai-us.ssnc-corp.cloud` (RAG endpoints, used by all three RAG
+    interactions: passthrough upload, sync, and TIA retrieval).
 - A valid **SS&C Cloud AI Gateway API key** and **User ID** with access to
   the configured model (default `global.anthropic.claude-sonnet-4-6`).
 - A registered **use-case ID** for AI Gateway billing/governance.
@@ -118,7 +161,7 @@ This installs four packages: `openpyxl`, `python-dotenv`, `requests`, and
 
 ### 4. Create the working-directory tree
 
-The pipeline expects ten directories to exist (it auto-creates output
+The pipeline expects nine directories to exist (it auto-creates output
 subdirs when missing, but pre-creating everything avoids first-run noise).
 Default layout:
 
@@ -130,7 +173,7 @@ $dirs = @(
     "Processing", "Processed",
     "OutputReport",
     "ReferenceToBeLoaded", "ReferenceLoaded",
-    "ReferenceJson", "ReferenceJsonExtracted",
+    "ReferenceJson",
     "Logs"
 )
 foreach ($d in $dirs) { New-Item -ItemType Directory -Force "$base\$d" | Out-Null }
@@ -153,13 +196,20 @@ Then open `.env` and:
 
 `.env` is gitignored by design — never commit it.
 
-### 6. (Optional) Drop a reference workbook into the inbox
+### 6. (Optional) Drop reference material into the inbox
 
-If you want the first run to actually populate RAG, drop a TIA reference
-workbook (e.g. `Technical Infrastructure Assessment V2.6.4.xlsm`) into
-`REFERENCE_TO_BE_LOADED_DIR`. Otherwise the reference stage is a
-no-op and the RAG sync stage runs against whatever's already in the RAG
-store at the gateway.
+If you want the first run to actually populate RAG, drop reference
+material into `REFERENCE_TO_BE_LOADED_DIR`:
+
+- A TIA reference workbook (e.g.
+  `Technical Infrastructure Assessment V2.6.4.xlsm`) goes through the
+  extraction lifecycle.
+- A PDF reference (e.g. an installation or admin guide) goes through the
+  passthrough lifecycle.
+
+Both kinds can sit in the same inbox; each is handled by its own stage.
+Otherwise, both stages no-op and the RAG sync runs against whatever's
+already in the RAG store at the gateway.
 
 ### 7. Run
 
@@ -167,7 +217,7 @@ store at the gateway.
 & .\.venv\Scripts\python.exe run.py
 ```
 
-Expected: `=== run.py start ===` banner, four stage lines, exit 0. See
+Expected: `=== run.py start ===` banner, four stage banners, exit 0. See
 `Logs\logs.txt` for the full trace.
 
 ## Configuration reference
@@ -184,10 +234,9 @@ Every variable listed below is required in `.env` (the entry point's
 | `PROCESSING_DIR` | In-flight customer xlsx (claimed but not yet graduated). | `run.py` |
 | `PROCESSED_DIR` | Customer xlsx graduates here after successful conversion. | `run.py` |
 | `OUTPUT_REPORT_DIR` | Generated `TIA_<stem>_<timestamp>.md` reports. | `run.py`, `tia_generator.py` |
-| `REFERENCE_TO_BE_LOADED_DIR` | Reference TIA workbooks waiting to be ingested. | `reference_info_extractor.py` |
-| `REFERENCE_LOADED_DIR` | Reference xlsx graduates here after successful ingest. | `reference_info_extractor.py` |
-| `REFERENCE_JSON_DIR` | Per-sheet JSON from the reference Excel conversion. Wiped each reference run. | `reference_info_extractor.py`, `reference_json_combiner.py` |
-| `REFERENCE_JSON_EXTRACTED_DIR` | Per-sheet LLM-distilled JSON. Wiped each reference run. Source for RAG ingest. | `reference_json_combiner.py`, `run.py`, `rag_ingester.py` |
+| `REFERENCE_TO_BE_LOADED_DIR` | Heterogeneous inbox: xlsx/xlsm reference workbooks AND passthrough files (e.g. *.pdf). Each file type is picked up by its own stage. | `reference_info_extractor.py`, `reference_passthrough_ingester.py` |
+| `REFERENCE_LOADED_DIR` | Successfully-ingested reference materials of **all types** graduate here. Holds the source xlsx (from stage 1) and the PDFs (from stage 1.5). Stage 2 scans this dir for passthrough files when building the sync-gate local set. | `reference_info_extractor.py`, `reference_passthrough_ingester.py`, `run.py` |
+| `REFERENCE_JSON_DIR` | Holds both kinds of Excel-derived artifacts: source per-sheet JSON (`<workbook>__<sheet>.json`, wiped before each reference convert) and the LLM-distilled per-sheet extractions (`extracted_<sheet>_<ts>.json`, selectively wiped before each extract). The `extracted_*.json` files are the source for RAG ingest. | `reference_info_extractor.py`, `reference_json_combiner.py`, `run.py`, `rag_ingester.py` |
 | `LOG_DIR` | Holds `logs.txt` (append-mode across runs). | all entry points |
 
 ### Logging
@@ -202,8 +251,7 @@ Every variable listed below is required in `.env` (the entry point's
 |----------|---------|
 | `SSC_CLOUD_AIGATEWAY_API_KEY` | Auth — sent as `Authorization: Bearer ...` for `/v1/chat/completions`, and as `X-API-Key: ...` for all `/rag/...` endpoints. |
 | `SSC_CLOUD_AIGATEWAY_USER_ID` | Sent as `X-User-Id` on `/v1/chat/completions` calls (reference extraction stage only). |
-| `SSC_CLOUD_AIGATEWAY_BASE_URL` | Base for the OpenAI-compatible chat-completions endpoint (default `https://api-ai.ssnc.cloud/v1`). |
-| `SSC_CLOUD_RAG_BASE_URL` | Base for the RAG endpoints (default `https://api-ai-us.ssnc-corp.cloud`). |
+| `SSC_CLOUD_AIGATEWAY_BASE_URL` | Gateway root (default `https://api-ai.ssnc.cloud`). The same host serves both the OpenAI-compatible chat-completions endpoint (`/v1/chat/completions`) and the RAG endpoints (`/rag/...`); the path prefixes are appended by the code, so this var is just the host. An internal alias `https://api-ai-us.ssnc-corp.cloud` also exists but is only resolvable on the SS&C corporate network/VPN. |
 | `SSC_CLOUD_AIGATEWAY_MODEL` | Model name passed as `model` / `llm_name` in the LLM calls. |
 | `USE_CASE_ID` | Sent as `X-Use-Case-Id` on `/v1/chat/completions` calls (reference extraction stage only). |
 
@@ -215,7 +263,14 @@ Each of these can be invoked directly for testing one stage in isolation:
 # Stage 1 only: reference Excel → per-sheet JSON → LLM-distilled JSON.
 & .\.venv\Scripts\python.exe online_tia\reference_info_extractor.py
 
-# Stage 2 only: sync RAG with whatever's currently in REFERENCE_JSON_EXTRACTED_DIR.
+# Stage 1.5 only: scan REFERENCE_TO_BE_LOADED_DIR for passthrough files
+# (*.pdf etc.), upload each directly to RAG, and move it to LOADED.
+& .\.venv\Scripts\python.exe online_tia\reference_passthrough_ingester.py
+
+# Stage 2 only: sync RAG with the extracted_*.json files currently in REFERENCE_JSON_DIR.
+# (NB: the standalone harness ignores passthrough files in LOADED — only
+# run.py composes the full union. Run this for narrow RAG-vs-extractions
+# debugging.)
 & .\.venv\Scripts\python.exe online_tia\rag_ingester.py
 
 # Stages 3+4 in isolation: generate a TIA from whatever's currently in
@@ -227,7 +282,7 @@ Each of these can be invoked directly for testing one stage in isolation:
 ## User Guide
 
 Once deployment is complete (see *Deployment / setup* above), day-to-day
-usage is built around scheduling `run.py` and dropping files into the two
+usage is built around scheduling `run.py` and dropping files into the
 inbox directories. This section walks an operator through the model.
 
 ### Prerequisite
@@ -236,7 +291,7 @@ Before scheduling anything, confirm:
 
 - `.env` has been copied from `.env.example` and filled in with valid
   SS&C Cloud credentials (Deployment step 5).
-- All ten working directories from the *Configuration reference* tables
+- All nine working directories from the *Configuration reference* tables
   exist on disk (Deployment step 4).
 - The machine has network access to both gateway hosts
   (`api-ai.ssnc.cloud` and `api-ai-us.ssnc-corp.cloud`).
@@ -258,45 +313,47 @@ milliseconds — so a tight schedule is safe.
 
 ### What happens on each run
 
-Each `run.py` invocation does up to **two distinct things** in sequence,
-each triggered only when its inbox has files. With both inboxes empty,
-the run logs the skip lines and exits.
+Each `run.py` invocation does up to **two distinct kinds of work** in
+sequence, each triggered only when its inbox has files. With both inboxes
+empty, the run logs the skip lines and exits.
 
-#### 1. Reference data ingest — triggered by files in `REFERENCE_TO_BE_LOADED_DIR`
+#### 1. Reference material ingest — triggered by files in `REFERENCE_TO_BE_LOADED_DIR`
 
 This is how you populate the RAG knowledge base that the final report
-draws on. Drop a TIA reference workbook (e.g. an internal TIA template
-with scoring guidance, recommended configurations, severity rubrics)
-into `REFERENCE_TO_BE_LOADED_DIR`. The next `run.py` will:
+draws on. The inbox is **heterogeneous** — drop in any mix of supported
+reference materials and each is handled by its own lifecycle.
 
-1. **Convert** each sheet of the workbook to a per-sheet JSON file in
-   `REFERENCE_JSON_DIR`. This is a pure local Excel-to-JSON pass — every
-   cell value is serialized, dates become ISO strings, and empty cells
-   are dropped to keep the JSON compact. No LLM involved.
+**1a. Excel reference workbooks (`.xlsx`, `.xlsm`)** — for documents that
+benefit from per-sheet LLM distillation (TIA templates with scoring
+guidance, recommended configurations, severity rubrics). The pipeline:
 
-2. **Extract the useful content** from each sheet via an LLM call,
-   writing the result as
-   `extracted_<sheet>_<YYYYMMDD_HHMMSS>.json` in
-   `REFERENCE_JSON_EXTRACTED_DIR`. Raw per-sheet JSON typically contains
-   a lot of noise that isn't actionable for a customer report —
-   instructions tabs, change logs, version history, unanswered template
-   rows, header text appearing as data, duplicate scoring entries. A
-   focused LLM prompt distils each sheet down to a structured JSON
-   object of TIA-relevant facts (scoring tables, recommended
-   configurations, severity guidance, etc.), discarding the noise.
-   **One LLM call per sheet.**
+1. **Converts** each sheet to a per-sheet JSON file in
+   `REFERENCE_JSON_DIR`. Pure local Excel-to-JSON pass; no LLM involved.
+2. **Extracts the useful content** from each sheet via an LLM call,
+   writing `extracted_<sheet>_<YYYYMMDD_HHMMSS>.json` back into
+   `REFERENCE_JSON_DIR` alongside the source per-sheet JSONs.
+3. **Moves** the source workbook to `REFERENCE_LOADED_DIR` so it isn't
+   re-processed on the next run.
 
-3. **Upload** every freshly-extracted JSON to the SS&C Cloud RAG-as-a-
-   Service, where each file is chunked, vectorized, and stored. This is
-   the reference knowledge the final customer report retrieves from at
-   generation time. The upload step is idempotent: if the local set of
-   filenames already matches what's in RAG it skips entirely; if they
-   differ (because a new reference workbook was ingested) the stale RAG
-   entries are deleted and the fresh ones uploaded in their place.
+**1b. Passthrough files (currently `.pdf`)** — for documents that should
+go straight to RAG without client-side parsing (installation manuals,
+admin guides, reference whitepapers). The pipeline:
 
-After successful processing the source workbook is moved from
-`REFERENCE_TO_BE_LOADED_DIR` into `REFERENCE_LOADED_DIR` so
-it isn't re-processed on the next run.
+1. **Uploads** the file directly to RAG with the same `tia_reference`
+   tag the Excel extractions use, so chat retrieval treats them as one
+   pool.
+2. If a file of the same basename already exists in RAG, the prior
+   entry is **deleted first** (overwrite semantics — re-dropping a PDF
+   with the same name replaces what's there).
+3. **Moves** the source file to `REFERENCE_LOADED_DIR`, overwriting any
+   stale local copy. The PDF in `REFERENCE_LOADED_DIR` is what the
+   stage-2 sync gate uses to confirm "yes, this file is in RAG."
+
+**1c. After both 1a and 1b run**, stage 2 syncs RAG with the combined
+local set: every `extracted_*.json` in `REFERENCE_JSON_DIR` plus every
+passthrough file in `REFERENCE_LOADED_DIR`. If the basename set already
+matches RAG, it skips entirely (idempotent re-run). Otherwise the stale
+RAG entries are deleted and the fresh ones uploaded.
 
 #### 2. Customer report generation — triggered by files in `INPUT_DIR`
 
@@ -306,42 +363,60 @@ for a customer. Drop a completed customer TIA response workbook into
 
 1. **Convert** the workbook to per-sheet JSON in `INTERMEDIATE_JSON_DIR`
    (same Excel-to-JSON pass as the reference flow).
+2. **Generate the TIA report** section by section. The report is built
+   from ~8 sections (Executive Summary, Servers, Interactive Clients,
+   Disaster Recovery, Security, General Environment, Findings &
+   Recommendations, Outstanding Questions); each is a separate
+   `/rag/chat/completions` call combining the customer's JSON data with
+   the most relevant reference chunks retrieved from the RAG database.
+   The sections are concatenated into one Markdown document written to
+   `OUTPUT_REPORT_DIR` as `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md`.
 
-2. **Generate the TIA report** as a single LLM call that combines the
-   customer's JSON data with relevant reference chunks retrieved from
-   the RAG database. The LLM produces a Markdown document; the pipeline
-   writes it to `OUTPUT_REPORT_DIR` as
-   `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md`.
+   > **Why section by section?** The RAG chat endpoint silently caps its
+   > output near ~4096 tokens and ignores every max-token request
+   > parameter. A single all-in-one call therefore truncates a
+   > full-length report mid-content. Splitting the report keeps every
+   > call well under the cap. If any section still approaches the cap,
+   > a `TIA output may be TRUNCATED` WARNING is logged.
 
 Each customer workbook is processed **independently and sequentially** —
 `INTERMEDIATE_JSON_DIR` is wiped between files so each report is
 grounded in exactly one customer's data. After successful processing the
 source workbook graduates `INPUT_DIR → PROCESSING_DIR → PROCESSED_DIR`.
+If TIA generation fails for a file (e.g. gateway unreachable), the
+source xlsx is **left in `PROCESSING_DIR`** rather than graduating to
+`PROCESSED_DIR`, so the next scheduled run retries it.
 
 ### Logs
 
-Every operation is recorded in `LOG_DIR\logs.txt` in append mode, with
-ISO-style timestamps on every line. The log captures: per-stage banners,
-every per-file conversion outcome, every LLM call (initiation + success-
-with-sizes-and-citations *or* failure-with-error), every RAG operation
-(list / register / upload / delete), every wipe, and the final exit code
-per `run.py` invocation. The file grows across runs — rotate it manually
-or via your OS as needed.
+Every operation is recorded in `LOG_DIR\logs.txt`, with ISO-style
+timestamps on every line. The log captures: per-stage banners, every
+per-file conversion outcome, every passthrough upload start / overwrite
+/ OK / FAILED, every LLM call (initiation + success with sizes and
+citations *or* failure with error), every RAG operation (list /
+register / upload / delete), every wipe, and the final exit code per
+`run.py` invocation.
+
+`logs.txt` **auto-rotates** when it reaches 10 MB. Up to 5 historical
+backups are kept (`logs.txt.1` … `logs.txt.5`), giving an effective
+retention of ~60 MB before the oldest backup is dropped. No manual
+rotation is needed.
 
 Verbosity is controlled by **`LOG_LEVEL`** in `.env` — one of `DEBUG`,
 `INFO`, `WARNING`, `ERROR`, `CRITICAL` (case-insensitive; unknown values
 fall back to `INFO`). At `DEBUG` the RAG list-files response is also
-dumped in full structured form, which is useful when debugging RAG ingest
-state. For day-to-day operation `INFO` is the right setting.
+dumped in full structured form. For day-to-day operation `INFO` is the
+right setting.
 
 ## Outputs
 
 - **TIA reports**: `OUTPUT_REPORT_DIR\TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md`
   — one Markdown file per customer xlsx, with the source stem in the
   filename so per-file reports never collide.
-- **Logs**: `LOG_DIR\logs.txt` — append-mode, timestamped, captures every
-  stage banner, every LLM call (start / OK / FAILED), every RAG operation,
-  and the wipe events.
+- **Logs**: `LOG_DIR\logs.txt` — timestamped, captures every stage
+  banner, every LLM call (start / OK / FAILED), every RAG operation,
+  every passthrough upload, and the wipe events. Auto-rotates at 10 MB
+  with 5 backups kept (`logs.txt.1` … `logs.txt.5`).
 
 ## Tests
 
@@ -352,12 +427,13 @@ source module plus a smoke file:
 
 ```
 tests/
-├── conftest.py                          # adds online_tia/ to sys.path
-├── test_imports_smoke.py                # every module imports cleanly
+├── conftest.py                                # adds online_tia/ to sys.path
+├── test_imports_smoke.py                      # every module imports cleanly
 ├── test_excel_to_json.py
 ├── test_logging_setup.py
 ├── test_rag_ingester.py
 ├── test_reference_json_combiner.py
+├── test_reference_passthrough_ingester.py
 └── test_tia_generator.py
 ```
 
@@ -374,9 +450,9 @@ From the project root, using the venv-Python:
 & .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected output ends with `81 passed in ~2s` and exit code 0. If you see
-a failure, the line immediately above the summary identifies the file
-and test name.
+Expected output ends with `109 passed in ~2s` and exit code 0. If you
+see a failure, the line immediately above the summary identifies the
+file and test name.
 
 ### Common execution variations
 
@@ -405,22 +481,33 @@ same way as the full-suite command above. The leading
   `_read_customer_content`, `_build_user_message`, `_build_output_path`
   filename format, `_sha256`, `_build_rag_config`.
 - **HTTP-mocked behaviour for `rag_ingester`** — the sync gate's
-  match-vs-mismatch decision, the delete-all-then-reupload path, empty
-  source dir handling, and `_raise_for_status` / `list_files` HTTP-error
-  + connection-error propagation.
-
-What's **not** covered today: `_call_rag_chat` (tia_generator) and
-`_call_llm` (reference_json_combiner). Their happy paths and error
-handlers are currently exercised only by live `run.py` invocations
-against the gateway; bringing them into the mocked-HTTP suite is a
-worthwhile future addition.
+  match decision, the set-difference branch (only-stale deleted,
+  only-new uploaded, intersection preserved, tag-isolated so other
+  use-cases on the same gateway are invisible), the `extra_files`
+  parameter folding into the basename comparison, empty source dir
+  handling, and `_raise_for_status` / `list_files` HTTP-error +
+  connection-error propagation.
+- **HTTP-mocked behaviour for `reference_json_combiner._call_llm`** —
+  happy-path JSON unwrap, HTTP non-2xx, ConnectionError →
+  `GatewayUnreachable`, malformed outer JSON, inner content not JSON,
+  inner content not an object, empty content.
+- **HTTP-mocked behaviour for `tia_generator._call_rag_chat`** —
+  happy-path content extraction, HTTP non-2xx, ConnectionError
+  propagation, missing `content`, empty `content`, non-JSON body,
+  citations-list absent without crashing.
+- **End-to-end behaviour for `reference_passthrough_ingester`** with a
+  stub RagIngester — fresh upload + move, overwrite-deletes-prior path,
+  multiple prior-duplicate cleanup, upload failure leaves file in
+  inbox, listfiles failure aborts the stage, partial-batch failure rc
+  semantics, non-pattern files ignored.
 
 ### Offline guarantee
 
 The suite never makes a real network call. `requests.get` and
 `requests.post` are monkey-patched with `unittest.mock.patch` in the
-RAG-ingester tests; Excel fixtures are built in memory via `openpyxl`
-inside `tmp_path` directories per test. You can run the full suite on a
+RAG-ingester tests; the passthrough-ingester tests substitute a stub
+RagIngester; Excel fixtures are built in memory via `openpyxl` inside
+`tmp_path` directories per test. You can run the full suite on a
 machine without VPN or gateway access.
 
 ## Troubleshooting
@@ -432,16 +519,42 @@ machine without VPN or gateway access.
   machine can resolve both `api-ai.ssnc.cloud` and
   `api-ai-us.ssnc-corp.cloud` (corporate VPN may be required).
 - **`HTTP 404: Unsupported path`** — usually means
-  `SSC_CLOUD_AIGATEWAY_BASE_URL` or `SSC_CLOUD_RAG_BASE_URL` is wrong.
+  `SSC_CLOUD_AIGATEWAY_BASE_URL` is wrong.
   The base URL must NOT include `/chat/completions` or `/rag/ingest/...`
   — those path segments are appended by the code.
 - **`No xlsx in <inbox>; skipping convert and extract stages`** — expected
-  when the reference inbox is empty. To trigger reference processing, drop
-  a workbook into `REFERENCE_TO_BE_LOADED_DIR`.
+  when the reference inbox has no Excel files. Drop one into
+  `REFERENCE_TO_BE_LOADED_DIR` to trigger stage 1.
+- **`No passthrough files in <inbox> ...; stage is a no-op`** — expected
+  when the reference inbox has no PDFs (or other configured passthrough
+  patterns). Drop one to trigger stage 1.5.
+- **`overwrite: deleting prior RAG entry file_id=<id> for <name>`** —
+  informational. You re-dropped a file whose basename was already in
+  RAG; the prior entry is being replaced. If you didn't expect to see
+  this, check whether the same PDF was previously ingested.
+- **`passthrough upload FAILED for <name>: ...`** — RAG upload errored.
+  The file stays in the inbox so the next scheduled run retries
+  automatically. If the failure persists, check gateway reachability,
+  API key, and that `SSC_CLOUD_AIGATEWAY_BASE_URL` is correct.
+- **`Cannot list RAG files; aborting passthrough stage`** — stage 1.5
+  refused to upload anything because it couldn't read the current RAG
+  inventory (and so couldn't safely deduplicate). Inbox is left
+  untouched; usually a transient gateway issue.
 - **`--- stage: generate TIA report (skipped: no files in INPUT_DIR) ---`**
   — expected when no customer workbooks are present. Drop one into
   `INPUT_DIR` to trigger the per-file primary + TIA loop.
-- **RAG sync repeatedly re-uploads everything** — every reference run
-  produces fresh timestamped filenames, so the sync gate detects a
-  mismatch and rotates. If you want to avoid the re-upload, don't re-run
-  the reference stage (leave `REFERENCE_TO_BE_LOADED_DIR` empty).
+- **RAG sync re-uploads on every reference run** — every reference
+  extract pass produces fresh timestamped `extracted_*.json` filenames,
+  so the sync gate's set-difference sees old extractions as stale and
+  the new ones as new (delete + upload, one for one). If you want to
+  avoid the churn, don't re-run the reference extract stage (leave
+  `REFERENCE_TO_BE_LOADED_DIR` empty for xlsx). Passthrough files
+  alone do **not** cause this — their basenames are stable across
+  runs.
+- **`logs.txt` keeps growing** — it shouldn't past 10 MB. If you see
+  a single `logs.txt` much larger than that, the rotation handler
+  isn't picking up (rare; typically a permissions or
+  multi-process-write contention issue). Confirm with
+  `Get-Item logs.txt | Select-Object Length`, and look for
+  `logs.txt.1` … `logs.txt.5` siblings — those are the rotated
+  backups. Delete them manually if you want to reclaim disk.

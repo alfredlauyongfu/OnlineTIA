@@ -222,6 +222,58 @@ def test_process_one_failure_does_not_track(tmp_path: Path) -> None:
     assert moved == 0
 
 
+def test_unmark_processed_keeps_file_in_processing(tmp_path: Path) -> None:
+    """After a downstream-stage failure (e.g. TIA failed for this file), the
+    caller calls `unmark_processed(name)` to drop it from the finalize list.
+    finalize then doesn't graduate it to processed, and the file stays in
+    processing for the next-run retry."""
+    inbox = tmp_path / "inbox"
+    proc = tmp_path / "processing"
+    done = tmp_path / "processed"
+    out = tmp_path / "out"
+    inbox.mkdir()
+    xlsx = _make_workbook(inbox, "ws.xlsx", {"S": [["k"], ["v"]]})
+
+    conv = ExcelToJsonConverter(
+        input_dir=inbox, output_dir=out,
+        processing_dir=proc, processed_dir=done,
+    )
+    assert conv.process_one(xlsx) is True
+    assert conv.successfully_processed_paths == [proc / "ws.xlsx"]
+
+    removed = conv.unmark_processed("ws.xlsx")
+    assert removed == 1
+    assert conv.successfully_processed_paths == []
+
+    moved = conv.finalize_to_processed_dir()
+    assert moved == 0
+    # File stayed in processing for retry, did not graduate.
+    assert (proc / "ws.xlsx").exists()
+    assert not (done / "ws.xlsx").exists()
+
+
+def test_unmark_processed_unknown_name_is_noop(tmp_path: Path) -> None:
+    """Asking to unmark a file that isn't tracked returns 0 and leaves the
+    rest alone."""
+    inbox = tmp_path / "inbox"
+    proc = tmp_path / "processing"
+    done = tmp_path / "processed"
+    out = tmp_path / "out"
+    inbox.mkdir()
+    xlsx = _make_workbook(inbox, "kept.xlsx", {"S": [["k"], ["v"]]})
+
+    conv = ExcelToJsonConverter(
+        input_dir=inbox, output_dir=out,
+        processing_dir=proc, processed_dir=done,
+    )
+    conv.process_one(xlsx)
+    assert conv.successfully_processed_paths == [proc / "kept.xlsx"]
+
+    removed = conv.unmark_processed("does_not_exist.xlsx")
+    assert removed == 0
+    assert conv.successfully_processed_paths == [proc / "kept.xlsx"]
+
+
 def test_process_one_in_place_mode_no_move(tmp_path: Path) -> None:
     """When processing_dir/processed_dir are omitted, source stays put."""
     inbox = tmp_path / "inbox"

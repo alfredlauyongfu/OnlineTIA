@@ -15,6 +15,7 @@ the second call clears prior handlers before re-installing.
 from __future__ import annotations
 
 import logging
+import logging.handlers
 import os
 import sys
 from pathlib import Path
@@ -24,6 +25,11 @@ from dotenv import load_dotenv
 
 LOG_FILENAME = "logs.txt"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# Rotate logs.txt at 10 MB, keeping up to 5 historical backups
+# (logs.txt.1 ... logs.txt.5). Effective retention: ~60 MB of logs.
+LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_BACKUP_COUNT = 5
 
 
 def _resolve_level(log_level: int | str | None) -> int:
@@ -55,7 +61,13 @@ def configure_logging(log_dir: Path, log_level: int | str = logging.INFO) -> Non
 
     formatter = logging.Formatter(LOG_FORMAT)
 
-    file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_path,
+        mode="a",
+        encoding="utf-8",
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+    )
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)

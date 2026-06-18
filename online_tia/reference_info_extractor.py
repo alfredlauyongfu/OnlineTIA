@@ -1,14 +1,17 @@
 """Stage: full reference-info extraction pipeline.
 
   0. **Inbox guard**: if REFERENCE_TO_BE_LOADED_DIR is empty, skip
-     stages 1 and 2 entirely (REFERENCE_JSON_DIR and
-     REFERENCE_JSON_EXTRACTED_DIR are left untouched). Otherwise:
+     stages 1 and 2 entirely (REFERENCE_JSON_DIR is left untouched).
+     Otherwise:
   1. Convert .xlsx/.xlsm files in REFERENCE_TO_BE_LOADED_DIR to
      per-sheet JSON in REFERENCE_JSON_DIR (wiped first). Successfully
      converted xlsx files are then moved to REFERENCE_LOADED_DIR.
-  2. Run a per-sheet LLM extraction over REFERENCE_JSON_DIR, writing one
-     `extracted_{sheet}_{YYYYMMDD_HHMMSS}.json` per non-empty result to
-     REFERENCE_JSON_EXTRACTED_DIR (wiped first).
+  2. Run a per-sheet LLM extraction over the source per-sheet JSONs in
+     REFERENCE_JSON_DIR, writing one
+     `extracted_{sheet}_{YYYYMMDD_HHMMSS}.json` per non-empty result
+     back into the same REFERENCE_JSON_DIR. Any previous
+     `extracted_*.json` files are wiped first; the source per-sheet
+     JSONs from stage 1 are preserved.
 
 Downstream consumers push the extracted files into the RAG service via
 `rag_ingester.RagIngester` (out of scope for this module).
@@ -37,7 +40,6 @@ REQUIRED_ENV_VARS = (
     "REFERENCE_TO_BE_LOADED_DIR",
     "REFERENCE_LOADED_DIR",
     "REFERENCE_JSON_DIR",
-    "REFERENCE_JSON_EXTRACTED_DIR",
     "LOG_DIR",
 )
 
@@ -64,7 +66,7 @@ def extract() -> int:
     if not incoming:
         logger.info(
             "No xlsx in %s; skipping convert and extract stages "
-            "(REFERENCE_JSON_DIR and REFERENCE_JSON_EXTRACTED_DIR unchanged)",
+            "(REFERENCE_JSON_DIR unchanged)",
             to_be_loaded_dir,
         )
         return 0
@@ -94,16 +96,14 @@ def extract() -> int:
         use_case_id=os.environ["USE_CASE_ID"],
         model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
         reference_json_dir=reference_json_dir,
-        extracted_dir=Path(os.environ["REFERENCE_JSON_EXTRACTED_DIR"]),
     )
 
     logger.info("-- stage: extract reference json --")
     # Config summary stays as plain prints — it's per-run operator context,
     # not part of the persistent operational trail.
-    print(f"  source dir   : {combiner.reference_json_dir}")
-    print(f"  extracted dir: {combiner.extracted_dir}")
+    print(f"  reference dir: {combiner.reference_json_dir}")
     print(f"  model        : {combiner.model}")
-    print(f"  endpoint     : {combiner.api_url}/chat/completions")
+    print(f"  endpoint     : {combiner.api_url}/v1/chat/completions")
 
     rc_combine = combiner.combine()
     logger.info("extract stage finished (rc=%d)", rc_combine)
