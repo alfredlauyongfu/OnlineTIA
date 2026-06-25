@@ -16,7 +16,7 @@
 Downstream consumers push the extracted files into the RAG service via
 `rag_ingester.RagIngester` (out of scope for this module).
 
-Can be run directly (python online_tia\reference_info_extractor.py) for
+Can be run directly (python src\reference_info_extractor.py) for
 isolated testing, or imported by run.py.
 """
 

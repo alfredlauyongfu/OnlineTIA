@@ -60,7 +60,7 @@ and each TIA report is based on exactly one input file.
 | `.pdf` | **Passthrough**: uploaded as-is to RAG (no client-side parsing — the gateway handles chunking/vectorization). Source PDF moves to `REFERENCE_LOADED_DIR` after successful upload. | `reference_passthrough_ingester.py` |
 
 The passthrough patterns are configured in
-`online_tia/reference_passthrough_ingester.py`:
+`src/reference_passthrough_ingester.py`:
 
 ```python
 PASSTHROUGH_PATTERNS: tuple[str, ...] = ("*.pdf",)
@@ -71,19 +71,19 @@ Adding more passthrough types (e.g. `.docx`, `.txt`) is a one-line change
 
 ## Modules
 
-All source modules live under `online_tia/` for neatness; `run.py` is the
+All source modules live under `src/` for neatness; `run.py` is the
 only Python file at the project root.
 
 | File | What it does |
 |------|-------------|
 | `run.py` | CLI entry point. Runs all four stages in the order above. |
-| `online_tia/reference_info_extractor.py` | Stage 1 orchestrator: reference Excel → JSON → LLM-extracted JSON. |
-| `online_tia/reference_passthrough_ingester.py` | Stage 1.5 orchestrator: glob non-Excel patterns in the inbox → direct RAG upload (overwrite-aware) → move to LOADED. |
-| `online_tia/excel_to_json.py` | `ExcelToJsonConverter` — Excel→JSON conversion + claim/processed move lifecycle. |
-| `online_tia/reference_json_combiner.py` | `ReferenceJsonCombiner` — per-sheet LLM extraction via `/v1/chat/completions`. |
-| `online_tia/rag_ingester.py` | `RagIngester` — list/register/upload/delete against `/rag/ingest/*`, with basename-equality sync gate (now supports `extra_files` for cross-dir local sets). |
-| `online_tia/tia_generator.py` | `TiaReportGenerator` — generates the Markdown TIA via `/rag/chat/completions`, **one section at a time** (the endpoint hard-caps output near ~4096 tokens, so a single all-in-one call truncates), then concatenates. Warns if any section nears the cap. |
-| `online_tia/logging_setup.py` | `configure_logging` + `bootstrap` (.env load + required-var check + logging). |
+| `src/reference_info_extractor.py` | Stage 1 orchestrator: reference Excel → JSON → LLM-extracted JSON. |
+| `src/reference_passthrough_ingester.py` | Stage 1.5 orchestrator: glob non-Excel patterns in the inbox → direct RAG upload (overwrite-aware) → move to LOADED. |
+| `src/excel_to_json.py` | `ExcelToJsonConverter` — Excel→JSON conversion + claim/processed move lifecycle. |
+| `src/reference_json_combiner.py` | `ReferenceJsonCombiner` — per-sheet LLM extraction via `/v1/chat/completions`. |
+| `src/rag_ingester.py` | `RagIngester` — list/register/upload/delete against `/rag/ingest/*`, with basename-equality sync gate (now supports `extra_files` for cross-dir local sets). |
+| `src/tia_generator.py` | `TiaReportGenerator` — generates the Markdown TIA via `/rag/chat/completions`, **one section at a time** (the endpoint hard-caps output near ~4096 tokens, so a single all-in-one call truncates), then concatenates. Warns if any section nears the cap. |
+| `src/logging_setup.py` | `configure_logging` + `bootstrap` (.env load + required-var check + logging). |
 
 Four of the modules (`reference_info_extractor.py`,
 `reference_passthrough_ingester.py`, `rag_ingester.py`,
@@ -241,22 +241,22 @@ Each of these can be invoked directly for testing one stage in isolation:
 
 ```powershell
 # Stage 1 only: reference Excel → per-sheet JSON → LLM-distilled JSON.
-& .\.venv\Scripts\python.exe online_tia\reference_info_extractor.py
+& .\.venv\Scripts\python.exe src\reference_info_extractor.py
 
 # Stage 1.5 only: scan REFERENCE_TO_BE_LOADED_DIR for passthrough files
 # (*.pdf etc.), upload each directly to RAG, and move it to LOADED.
-& .\.venv\Scripts\python.exe online_tia\reference_passthrough_ingester.py
+& .\.venv\Scripts\python.exe src\reference_passthrough_ingester.py
 
 # Stage 2 only: sync RAG with the extracted_*.json files currently in REFERENCE_JSON_DIR.
 # (NB: the standalone harness ignores passthrough files in LOADED — only
 # run.py composes the full union. Run this for narrow RAG-vs-extractions
 # debugging.)
-& .\.venv\Scripts\python.exe online_tia\rag_ingester.py
+& .\.venv\Scripts\python.exe src\rag_ingester.py
 
 # Stages 3+4 in isolation: generate a TIA from whatever's currently in
 # INTERMEDIATE_JSON_DIR. (Doesn't run the per-file isolation loop; uses
 # whatever happens to be in that directory.)
-& .\.venv\Scripts\python.exe online_tia\tia_generator.py
+& .\.venv\Scripts\python.exe src\tia_generator.py
 ```
 
 ## User Guide
@@ -407,7 +407,7 @@ source module plus a smoke file:
 
 ```
 tests/
-├── conftest.py                                # adds online_tia/ to sys.path
+├── conftest.py                                # adds src/ to sys.path
 ├── test_imports_smoke.py                      # every module imports cleanly
 ├── test_excel_to_json.py
 ├── test_logging_setup.py

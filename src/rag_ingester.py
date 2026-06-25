@@ -11,7 +11,7 @@ Auth is via the `X-API-Key` header (reuses SSC_CLOUD_AIGATEWAY_API_KEY).
 This module is standalone — instantiating callers wire `RagIngester` in
 themselves. A bottom-of-file `main()` test harness lets you ingest every
 `extracted_*.json` file in REFERENCE_JSON_DIR with
-`python online_tia\rag_ingester.py`.
+`python src\rag_ingester.py`.
 """
 
 from __future__ import annotations
@@ -440,7 +440,7 @@ class RagIngester:
 # ---- standalone test harness ----
 #
 # Run directly to ingest every extracted_*.json file in REFERENCE_JSON_DIR:
-#   & C:\blueprism\OnlineTIA\.venv\Scripts\python.exe C:\blueprism\OnlineTIA\online_tia\rag_ingester.py
+#   & C:\blueprism\OnlineTIA\.venv\Scripts\python.exe C:\blueprism\OnlineTIA\src\rag_ingester.py
 #
 # Requires the per-sheet extracted files to already exist (run
 # reference_info_extractor.py first).

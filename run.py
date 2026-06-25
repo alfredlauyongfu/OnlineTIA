@@ -29,9 +29,9 @@ from pathlib import Path
 
 # Add the sibling source dir to sys.path so the project's modules can be
 # imported directly (e.g. `from excel_to_json import ...`). Keeps the module
-# files cleanly tucked into online_tia/ while run.py stays at the project
+# files cleanly tucked into src/ while run.py stays at the project
 # root as the single entry point.
-sys.path.insert(0, str(Path(__file__).resolve().parent / "online_tia"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
 import requests
 

@@ -331,7 +331,7 @@ class TiaReportGenerator:
 #
 # Run directly to generate a TIA from whatever is currently in
 # INTERMEDIATE_JSON_DIR:
-#   & C:\blueprism\OnlineTIA\.venv\Scripts\python.exe C:\blueprism\OnlineTIA\online_tia\tia_generator.py
+#   & C:\blueprism\OnlineTIA\.venv\Scripts\python.exe C:\blueprism\OnlineTIA\src\tia_generator.py
 #
 # Requires INTERMEDIATE_JSON_DIR to be populated (run run.py first) and the
 # reference files to already be ingested in the RAG store (run rag_ingester.py

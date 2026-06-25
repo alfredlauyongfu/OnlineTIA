@@ -18,7 +18,7 @@ flow per file:
        d. On RAG failure, leave the file in the inbox for next-run
           retry; stage rc becomes 1 but the loop continues.
 
-Can be run directly (python online_tia\\reference_passthrough_ingester.py)
+Can be run directly (python src\\reference_passthrough_ingester.py)
 for isolated testing, or imported by run.py.
 """
 
