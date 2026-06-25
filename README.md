@@ -13,52 +13,32 @@ relevant reference chunks and writes the resulting TIA report to disk.
 
 `run.py` runs **four stages** in this order on every invocation:
 
-```
-                  ┌─────────────────────────────┐
-                  │ 1. extract reference info   │   (xlsx/xlsm only;
-                  │                             │    skipped if inbox has none)
-                  │  REFERENCE_TO_BE_LOADED_DIR │
-   ReferenceTo  ──┤        ▶ convert ▶          ├─►  REFERENCE_JSON_DIR
-   BeLoaded ─►    │        │                    │     │   • source per-sheet:
-                  │        │ on success         │     │     <workbook>__<sheet>.json
-                  │        ▼                    │     │   • LLM extractions:
-                  │  REFERENCE_LOADED_DIR ◄─┐   │     │     extracted_<sheet>_<ts>.json
-                  └─────────────────────────┼───┘     │     (written back in-place)
-                                            │        │
-                  ┌─────────────────────────────┐    │
-                  │ 1.5 reference passthrough   │    │
-                  │                             │    │
-                  │  REFERENCE_TO_BE_LOADED_DIR │    │
-   PDF (etc.) ──► │     matched by              │    │
-                  │     PASSTHROUGH_PATTERNS    │    │
-                  │        ▶ RAG.ingest_file ▶  │    │
-                  │        │ (overwrite-aware)  │    │
-                  │        ▼                    │    │
-                  │  REFERENCE_LOADED_DIR ──────┘    │
-                  └─────────────────────────────┘    │
-                                                     │
-                  ┌─────────────────────────────┐    │
-                  │ 2. sync RAG with reference  │ ◄──┘
-                  │                             │
-                  │   local set = extracted_*.json ∪ LOADED *.pdf
-                  │   RAG set  = entries tagged "tia_reference" only
-                  │   set-difference:
-                  │     delete stale (in RAG, not local)
-                  │     upload  new   (local, not in RAG)
-                  │     keep    same  (in both)
-                  └─────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph REF["Reference ingest (stages 1, 1.5, 2)"]
+        direction TB
+        TBL["REFERENCE_TO_BE_LOADED_DIR<br/>(drop reference materials here)"]
+        TBL -->|"*.xlsx / *.xlsm"| S1["Stage 1 — extract reference info<br/>convert sheets, LLM-distill"]
+        TBL -->|"*.pdf (PASSTHROUGH_PATTERNS)"| S15["Stage 1.5 — passthrough ingest<br/>upload as-is, overwrite-aware"]
+        S1 -->|"extracted_*.json"| RJ["REFERENCE_JSON_DIR"]
+        S1 -->|"source workbook"| RL["REFERENCE_LOADED_DIR"]
+        S15 -->|"source file"| RL
+        RJ -->|"extracted_*.json"| S2["Stage 2 — sync RAG (idempotent)<br/>set-difference vs tag tia_reference"]
+        RL -->|"*.pdf"| S2
+        S15 -->|"upload"| RAG[("RAG store<br/>tag: tia_reference")]
+        S2 -->|"delete stale / upload new / keep"| RAG
+    end
 
-                  ┌─────────────────────────────┐
-                  │ 3. primary + 4. TIA report  │  (per-file loop; skipped if INPUT empty)
-                  │                             │
-   INPUT_DIR ─►───┤  for each xlsx:             │
-   (customer)     │    wipe INTERMEDIATE        │
-                  │    convert ──► INTERMEDIATE_JSON_DIR (one file's sheets only)
-                  │    section-by-section LLM /rag/chat/completions
-                  │      (tags=["tia_reference"]; ~8 calls, one per report section)
-                  │    write TIA_<stem>_<ts>.md to OUTPUT_REPORT_DIR
-                  │  finalize: PROCESSING ──► PROCESSED (only if TIA succeeded)
-                  └─────────────────────────────┘
+    subgraph CUST["Customer report (stages 3 + 4, per file)"]
+        direction TB
+        IN["INPUT_DIR<br/>customer *.xlsx / *.xlsm"]
+        IN -->|"one file at a time"| S3["Stage 3 — convert to JSON<br/>(wipe INTERMEDIATE first)"]
+        S3 --> S4["Stage 4 — generate TIA<br/>section-by-section, ~8 RAG calls"]
+        S4 -->|"TIA_&lt;stem&gt;_&lt;ts&gt;.md"| OUT["OUTPUT_REPORT_DIR"]
+        S3 -.->|"INPUT → PROCESSING → PROCESSED<br/>(only if TIA succeeded)"| PROC["PROCESSED_DIR"]
+    end
+
+    RAG -. "retrieval (tags=tia_reference)" .-> S4
 ```
 
 `REFERENCE_LOADED_DIR` now holds **both** kinds of successfully-ingested
