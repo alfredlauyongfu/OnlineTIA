@@ -57,6 +57,16 @@ topic (object, list of objects, etc.). Omit any key whose value would be empty.
 
 If the sheet contributes nothing useful, output exactly: {}
 
+Keep the JSON COMPACT — large sheets otherwise overflow the response limit:
+- Do NOT copy long guidance / help / explanatory paragraphs verbatim. Where a
+  scoring table gives per-option guidance, condense it to at most one short
+  phrase, or omit it and keep just the option label and its score/rating.
+- Do not repeat a question's full wording as both a key and a value; use a
+  short snake_case key and keep the value to the essential fact.
+- For scoring/rating tables, prefer capturing the recommended/best value and
+  the key thresholds compactly rather than enumerating every option in full.
+- Avoid duplicated boilerplate across entries; state shared context once.
+
 Output requirements:
 - Output ONLY valid JSON. No markdown fences, no commentary, no preamble.
 - Use snake_case for all keys.
@@ -65,10 +75,12 @@ Output requirements:
 
 
 class ReferenceJsonCombiner:
-    # Per-call output cap. The default max_tokens on the gateway truncates
-    # response JSON around ~4K tokens (~14-16K chars), which produces
-    # "Unterminated string" parse errors for large sheets.
-    EXTRACT_MAX_TOKENS = 16384
+    # Per-call output cap. The gateway's default max_tokens truncates response
+    # JSON around ~4K tokens; 16384 was insufficient for the largest sheet
+    # (SQL_Server), whose verbose scoring JSON overflowed and produced an
+    # invalid-JSON parse error. Raised to 32768 and paired with the
+    # "keep the JSON COMPACT" directives in EXTRACT_SYSTEM_PROMPT.
+    EXTRACT_MAX_TOKENS = 32768
 
     def __init__(
         self,
