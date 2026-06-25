@@ -129,8 +129,18 @@ class TiaReportGenerator:
          "data, grouped by area. Do NOT invent answers — only list what needs clarifying."),
     )
 
-    # Label for the internal phase-1 call (not emitted as a report section).
+    # Labels for the internal phase-1 calls (not emitted as report sections).
     ANALYSIS_LABEL = "Canonical analysis"
+    VERIFICATION_LABEL = "Analysis verification"
+
+    # Sheets in the customer workbook that are embedded REFERENCE scaffolding
+    # (the version/scale lookup table and the answer→guidance scoring table),
+    # not customer answers. They are excluded from the payload sent to the LLM:
+    # feeding them invites the model to misread reference values (e.g. a sizing
+    # table's CPU/RAM minimums) as the customer's actual configuration, and they
+    # bloat the prompt. The same reference content is available via the RAG store.
+    # Matched case-insensitively against the sheet name (the part after `__`).
+    EXCLUDED_SHEET_NAMES = frozenset({"data", "qandadata"})
 
     # If a section's completion_tokens lands at/above this, the gateway very
     # likely truncated it at its ~4096-token ceiling — warn the operator.
@@ -182,10 +192,21 @@ class TiaReportGenerator:
         # different severities for the same issue, contradictory version verdicts.
         # Anchoring every section to this single analysis eliminates that drift.
         logger.info("TIA analysis pass: %s", self.ANALYSIS_LABEL)
-        analysis = self._strip_code_fence(
+        draft_analysis = self._strip_code_fence(
             self._call_rag_chat(
                 data_block + self._analysis_directive(),
                 section=self.ANALYSIS_LABEL,
+            )
+        ).strip()
+
+        # Phase 1b — verification: audit the draft so an ungrounded finding (one
+        # inferred from a reference/sizing table rather than a stated answer)
+        # doesn't get propagated confidently into every section.
+        logger.info("TIA analysis verification pass: %s", self.VERIFICATION_LABEL)
+        analysis = self._strip_code_fence(
+            self._call_rag_chat(
+                data_block + self._verification_directive(draft_analysis),
+                section=self.VERIFICATION_LABEL,
             )
         ).strip()
         canonical = self._canonical_block(analysis)
@@ -217,12 +238,24 @@ class TiaReportGenerator:
     @staticmethod
     def _read_customer_content(customer_json_dir: Path) -> dict[str, Any]:
         result: dict[str, Any] = {}
+        skipped: list[str] = []
         for jf in sorted(customer_json_dir.glob("*.json")):
+            # Sheet name = the part after `__` (ExcelToJsonConverter naming);
+            # fall back to the stem when there's no separator.
+            sheet = jf.stem.split("__", 1)[1] if "__" in jf.stem else jf.stem
+            if sheet.lower() in TiaReportGenerator.EXCLUDED_SHEET_NAMES:
+                skipped.append(jf.name)
+                continue
             try:
                 with jf.open("r", encoding="utf-8") as f:
                     result[jf.name] = json.load(f)
             except Exception as exc:
                 logger.warning("skip (read error) %s: %s", jf.name, exc)
+        if skipped:
+            logger.info(
+                "excluded %d reference-scaffolding sheet(s) from customer payload: %s",
+                len(skipped), ", ".join(skipped),
+            )
         return result
 
     @staticmethod
@@ -254,7 +287,39 @@ class TiaReportGenerator:
             "One row per material issue derived from the customer answers, each rated "
             "with the four-level severity scale from the system prompt, ordered by "
             "severity (Critical first). Do NOT include compliant items. Keep each cell "
-            "to one concise sentence.\n"
+            "to one concise sentence.\n\n"
+            "Grounding rule (critical): a finding may assert a customer configuration "
+            "ONLY when it is an EXPLICIT answer the customer gave. Never infer the "
+            "customer's hardware specs, counts, versions, or settings from a "
+            "reference, lookup, sizing, or scoring table. If the customer did not "
+            "state a value (e.g. actual CPU/RAM), record it under Environment Facts as "
+            "'not provided' — do NOT raise an under-/over-provisioning finding from a "
+            "sizing-table value, and leave it for the Outstanding Questions section.\n"
+        )
+
+    @staticmethod
+    def _verification_directive(draft_analysis: str) -> str:
+        """Phase-1b instruction. Audits the draft analysis for grounding before it
+        becomes the authoritative source of truth, removing findings that assert
+        configurations the customer never explicitly stated (the highest-assurance
+        guard against the analysis confidently propagating a misread to every
+        section)."""
+        return (
+            "\nThis is the ANALYSIS VERIFICATION phase. Below is a DRAFT canonical "
+            "analysis. Audit it and re-output a CORRECTED version in the SAME two-part "
+            "format (## Environment Facts, then ## Findings Ledger).\n\n"
+            "Rules:\n"
+            "- Keep every well-grounded finding unchanged — same ID, severity, and "
+            "wording.\n"
+            "- A finding may assert a customer configuration ONLY if it is an EXPLICIT "
+            "customer answer. If a finding asserts a spec/count/setting the customer "
+            "did not state — e.g. CPU/RAM inferred from a sizing/lookup table — REMOVE "
+            "it from the ledger and instead record the missing value under Environment "
+            "Facts as 'not provided' (it will surface in Outstanding Questions).\n"
+            "- Do NOT invent new findings or change severities of grounded findings.\n"
+            "- Re-check every figure in Environment Facts against the customer answers.\n\n"
+            "DRAFT ANALYSIS:\n"
+            f"{draft_analysis}\n"
         )
 
     @staticmethod

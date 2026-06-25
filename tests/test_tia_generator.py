@@ -274,20 +274,22 @@ def test_generate_produces_all_sections(tmp_path, monkeypatch) -> None:
     text = out.read_text(encoding="utf-8")
 
     expected = [title for title, _ in TiaReportGenerator.REPORT_SECTIONS]
-    # Phase 1 analysis pass runs first, then one call per section, in order.
+    # Phase 1 analysis + 1b verification run first, then one call per section.
     assert seen_sections[0] == TiaReportGenerator.ANALYSIS_LABEL
-    assert seen_sections[1:] == expected
+    assert seen_sections[1] == TiaReportGenerator.VERIFICATION_LABEL
+    assert seen_sections[2:] == expected
     assert text.startswith("# Technical Infrastructure Assessment")
     for title in expected:
         assert f"## {title}" in text                      # every section present
-    # The internal analysis pass is scaffolding, not a rendered section.
+    # The internal analysis/verification passes are scaffolding, not sections.
     assert f"## {TiaReportGenerator.ANALYSIS_LABEL}" not in text
+    assert f"## {TiaReportGenerator.VERIFICATION_LABEL}" not in text
 
 
-def test_generate_injects_canonical_analysis_into_every_section(tmp_path, monkeypatch) -> None:
-    """The phase-1 analysis output is injected verbatim into each section prompt
-    as the authoritative source of truth — this is what keeps figures/severities
-    consistent across the independently-generated sections."""
+def test_generate_injects_verified_analysis_into_every_section(tmp_path, monkeypatch) -> None:
+    """The phase-1 draft is audited by the verification pass, and it is the
+    VERIFIED analysis (not the raw draft) that is injected into each section as
+    the authoritative source of truth."""
     src = tmp_path / "src"
     src.mkdir()
     (src / "a.json").write_text("{}", encoding="utf-8")
@@ -297,7 +299,11 @@ def test_generate_injects_canonical_analysis_into_every_section(tmp_path, monkey
 
     def fake_call(self, user_message, section=None):
         if section == TiaReportGenerator.ANALYSIS_LABEL:
-            return "## Findings Ledger\nCANON-MARKER-XYZ"
+            return "## Findings Ledger\nDRAFT-MARKER"
+        if section == TiaReportGenerator.VERIFICATION_LABEL:
+            # The verification pass receives the draft to audit...
+            assert "DRAFT-MARKER" in user_message
+            return "## Findings Ledger\nVERIFIED-MARKER"
         section_prompts[section] = user_message
         return f"## {section}\nbody"
 
@@ -306,8 +312,27 @@ def test_generate_injects_canonical_analysis_into_every_section(tmp_path, monkey
 
     assert section_prompts  # at least one section was rendered
     for section, prompt in section_prompts.items():
-        assert "CANON-MARKER-XYZ" in prompt, f"{section} prompt missing canonical analysis"
+        # ...and it is the verified output that anchors the sections.
+        assert "VERIFIED-MARKER" in prompt, f"{section} prompt missing verified analysis"
+        assert "DRAFT-MARKER" not in prompt
         assert "AUTHORITATIVE ANALYSIS" in prompt
+
+
+def test_read_customer_content_excludes_reference_sheets(tmp_path) -> None:
+    """The embedded reference scaffolding sheets (Data, QandAData) are dropped
+    from the customer payload; answer sheets are kept."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "wb__Summary.json").write_text('{"v": 6.8}', encoding="utf-8")
+    (src / "wb__Questions.json").write_text('{"q": "a"}', encoding="utf-8")
+    (src / "wb__Data.json").write_text('{"ref": "lookup"}', encoding="utf-8")
+    (src / "wb__QandAData.json").write_text('{"ref": "guidance"}', encoding="utf-8")
+
+    content = TiaReportGenerator._read_customer_content(src)
+
+    assert set(content) == {"wb__Summary.json", "wb__Questions.json"}
+    assert "wb__Data.json" not in content
+    assert "wb__QandAData.json" not in content
 
 
 def test_generate_strips_section_code_fences(tmp_path, monkeypatch) -> None:

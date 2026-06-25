@@ -121,13 +121,12 @@ cd OnlineTIA
 
 ### 2. Create and activate a virtual environment
 
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
+Using the Windows Command Prompt (`cmd.exe`):
 
-If activation is blocked by execution policy:
-`Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned` then retry.
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+```
 
 ### 3. Install Python dependencies
 
