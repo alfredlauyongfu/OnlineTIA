@@ -133,6 +133,13 @@ class TiaReportGenerator:
     ANALYSIS_LABEL = "Canonical analysis"
     VERIFICATION_LABEL = "Analysis verification"
 
+    # The report's title block (Markdown). Shared by the .md assembly and the
+    # independent .docx writer so both formats carry the same heading.
+    REPORT_TITLE = (
+        "# Technical Infrastructure Assessment\n"
+        "### Blue Prism Enterprise — Customer Environment\n"
+    )
+
     # Sheets in the customer workbook that are embedded REFERENCE scaffolding
     # (the version/scale lookup table and the answer→guidance scoring table),
     # not customer answers. They are excluded from the payload sent to the LLM:
@@ -231,6 +238,25 @@ class TiaReportGenerator:
             "TIA written: %s (%d bytes, %d sections)",
             out_path, out_path.stat().st_size, len(section_texts),
         )
+
+        # Independent, best-effort Word output. Built natively from the same
+        # in-memory section content (NOT by converting the .md file). A missing
+        # python-docx or any render error degrades to a warning so it can never
+        # affect the .md output or the pipeline's success.
+        docx_path = out_path.with_suffix(".docx")
+        try:
+            from docx_writer import write_docx
+
+            write_docx(self.REPORT_TITLE, section_texts, docx_path)
+            logger.info(
+                "TIA Word written: %s (%d bytes)",
+                docx_path, docx_path.stat().st_size,
+            )
+        except Exception as exc:
+            logger.warning(
+                "TIA Word generation skipped for %s: %s", docx_path.name, exc
+            )
+
         return out_path
 
     # ---- internals ----
@@ -345,15 +371,11 @@ class TiaReportGenerator:
             "above exactly; do not re-derive counts or re-rate findings.\n"
         )
 
-    @staticmethod
-    def _assemble_report(section_texts: list[str]) -> str:
+    @classmethod
+    def _assemble_report(cls, section_texts: list[str]) -> str:
         """Join the per-section Markdown into one document with a title header
         and horizontal rules between sections."""
-        title = (
-            "# Technical Infrastructure Assessment\n"
-            "### Blue Prism Enterprise — Customer Environment\n"
-        )
-        return title + "\n---\n\n" + "\n\n---\n\n".join(section_texts) + "\n"
+        return cls.REPORT_TITLE + "\n---\n\n" + "\n\n---\n\n".join(section_texts) + "\n"
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:

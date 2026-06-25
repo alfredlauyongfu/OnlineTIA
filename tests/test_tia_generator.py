@@ -286,6 +286,49 @@ def test_generate_produces_all_sections(tmp_path, monkeypatch) -> None:
     assert f"## {TiaReportGenerator.VERIFICATION_LABEL}" not in text
 
 
+def test_generate_also_writes_sibling_docx(tmp_path, monkeypatch) -> None:
+    """generate() returns the .md path but also writes a sibling .docx with the
+    same stem (independent, best-effort Word output)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.json").write_text("{}", encoding="utf-8")
+    gen = _make_gen(tmp_path)
+
+    def fake_call(self, user_message, section=None):
+        return f"## {section}\nbody"
+
+    monkeypatch.setattr(TiaReportGenerator, "_call_rag_chat", fake_call)
+    out = gen.generate(src, filename_prefix="TIA_test")
+
+    assert out.suffix == ".md" and out.exists()
+    docx = out.with_suffix(".docx")
+    assert docx.exists() and docx.stat().st_size > 0
+
+
+def test_generate_docx_failure_does_not_break_md(tmp_path, monkeypatch) -> None:
+    """If the independent .docx step throws, the .md is still written, the
+    return value is the .md, and no exception escapes (decoupled outputs)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.json").write_text("{}", encoding="utf-8")
+    gen = _make_gen(tmp_path)
+    monkeypatch.setattr(
+        TiaReportGenerator, "_call_rag_chat",
+        lambda self, m, section=None: f"## {section}\nbody",
+    )
+
+    import docx_writer
+
+    def boom(*a, **k):
+        raise RuntimeError("docx exploded")
+
+    monkeypatch.setattr(docx_writer, "write_docx", boom)
+
+    out = gen.generate(src, filename_prefix="TIA_test")
+    assert out.suffix == ".md" and out.exists()              # md still written
+    assert not out.with_suffix(".docx").exists()             # docx skipped, no crash
+
+
 def test_generate_injects_verified_analysis_into_every_section(tmp_path, monkeypatch) -> None:
     """The phase-1 draft is audited by the verification pass, and it is the
     VERIFIED analysis (not the raw draft) that is injected into each section as

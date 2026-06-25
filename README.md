@@ -11,6 +11,22 @@ relevant reference chunks and writes the resulting TIA report to disk.
 
 ## Architecture / data flow
 
+### At a glance
+
+The whole system in one picture: reference materials build a searchable
+knowledge base; a customer's Excel response is assessed against it; out
+comes a report in Markdown **and** Word.
+
+```mermaid
+flowchart LR
+    REF["Reference materials<br/>(TIA workbooks + PDFs)"] --> KB[("RAG knowledge base")]
+    CUST["Customer response<br/>(Excel workbook)"] --> ENGINE["TIA engine<br/>(RAG-grounded LLM)"]
+    KB -. grounds .-> ENGINE
+    ENGINE --> OUT["TIA report<br/>Markdown + Word"]
+```
+
+### Detailed flow
+
 `run.py` runs **four stages** in this order on every invocation:
 
 ```mermaid
@@ -33,8 +49,8 @@ flowchart TD
         direction TB
         IN["INPUT_DIR<br/>customer *.xlsx / *.xlsm"]
         IN -->|"one file at a time"| S3["Stage 3 — convert to JSON<br/>(wipe INTERMEDIATE first)"]
-        S3 --> S4["Stage 4 — generate TIA<br/>canonical analysis + 8 sections (~9 RAG calls)"]
-        S4 -->|"TIA_&lt;stem&gt;_&lt;ts&gt;.md"| OUT["OUTPUT_REPORT_DIR"]
+        S3 --> S4["Stage 4 — generate TIA<br/>canonical analysis → verification → 8 sections"]
+        S4 -->|"TIA_&lt;stem&gt;_&lt;ts&gt;"| OUT["OUTPUT_REPORT_DIR<br/>.md + .docx"]
         S3 -.->|"INPUT → PROCESSING → PROCESSED<br/>(only if TIA succeeded)"| PROC["PROCESSED_DIR"]
     end
 
@@ -135,8 +151,9 @@ python -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-This installs four packages: `openpyxl`, `python-dotenv`, `requests`, and
-`pytest` (needed for running the test suite).
+This installs five packages: `openpyxl`, `python-dotenv`, `requests`,
+`python-docx` (for the Word report output), and `pytest` (needed for
+running the test suite).
 
 ### 4. Create the working-directory tree
 
@@ -353,7 +370,12 @@ for a customer. Drop a completed customer TIA response workbook into
    customer's JSON data, the canonical analysis, and the most relevant
    reference chunks retrieved from the RAG database. The sections are
    concatenated into one Markdown document written to `OUTPUT_REPORT_DIR`
-   as `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md` (~9 RAG calls total).
+   as `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md` (~9 RAG calls total). A
+   **Microsoft Word copy** (`.docx`) is then written alongside it from the
+   same content — independently and best-effort: it is built natively
+   (headings, tables, lists), not converted from the `.md` file, and if
+   Word generation fails the `.md` is unaffected and the run still
+   succeeds.
 
    > **Why section by section?** The RAG chat endpoint silently caps its
    > output near ~4096 tokens and ignores every max-token request
@@ -396,9 +418,11 @@ right setting.
 
 ## Outputs
 
-- **TIA reports**: `OUTPUT_REPORT_DIR\TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md`
-  — one Markdown file per customer xlsx, with the source stem in the
-  filename so per-file reports never collide.
+- **TIA reports**: each customer xlsx yields a matching pair in
+  `OUTPUT_REPORT_DIR` — `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md`
+  (Markdown, authoritative) and `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.docx`
+  (Microsoft Word, generated independently and best-effort). The source
+  stem in the filename keeps per-file reports from colliding.
 - **Logs**: `LOG_DIR\logs.txt` — timestamped, captures every stage
   banner, every LLM call (start / OK / FAILED), every RAG operation,
   every passthrough upload, and the wipe events. Auto-rotates at 10 MB
