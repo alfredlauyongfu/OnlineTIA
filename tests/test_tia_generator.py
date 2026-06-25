@@ -254,8 +254,9 @@ def test_call_rag_chat_no_warning_under_threshold(tmp_path, caplog) -> None:
 # ---------- sectioned generate() ----------
 
 def test_generate_produces_all_sections(tmp_path, monkeypatch) -> None:
-    """generate() makes one RAG call per section (in order) and assembles every
-    section heading plus the document title into the output file."""
+    """generate() runs the canonical analysis pass first, then one RAG call per
+    section (in order), and assembles every section heading plus the document
+    title. The internal analysis pass is NOT emitted as report content."""
     src = tmp_path / "src"
     src.mkdir()
     (src / "a.json").write_text(json.dumps({"k": "v"}), encoding="utf-8")
@@ -273,10 +274,40 @@ def test_generate_produces_all_sections(tmp_path, monkeypatch) -> None:
     text = out.read_text(encoding="utf-8")
 
     expected = [title for title, _ in TiaReportGenerator.REPORT_SECTIONS]
-    assert seen_sections == expected                      # one call per section, in order
+    # Phase 1 analysis pass runs first, then one call per section, in order.
+    assert seen_sections[0] == TiaReportGenerator.ANALYSIS_LABEL
+    assert seen_sections[1:] == expected
     assert text.startswith("# Technical Infrastructure Assessment")
     for title in expected:
         assert f"## {title}" in text                      # every section present
+    # The internal analysis pass is scaffolding, not a rendered section.
+    assert f"## {TiaReportGenerator.ANALYSIS_LABEL}" not in text
+
+
+def test_generate_injects_canonical_analysis_into_every_section(tmp_path, monkeypatch) -> None:
+    """The phase-1 analysis output is injected verbatim into each section prompt
+    as the authoritative source of truth — this is what keeps figures/severities
+    consistent across the independently-generated sections."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.json").write_text("{}", encoding="utf-8")
+    gen = _make_gen(tmp_path)
+
+    section_prompts: dict[str, str] = {}
+
+    def fake_call(self, user_message, section=None):
+        if section == TiaReportGenerator.ANALYSIS_LABEL:
+            return "## Findings Ledger\nCANON-MARKER-XYZ"
+        section_prompts[section] = user_message
+        return f"## {section}\nbody"
+
+    monkeypatch.setattr(TiaReportGenerator, "_call_rag_chat", fake_call)
+    gen.generate(src, filename_prefix="TIA_test")
+
+    assert section_prompts  # at least one section was rendered
+    for section, prompt in section_prompts.items():
+        assert "CANON-MARKER-XYZ" in prompt, f"{section} prompt missing canonical analysis"
+        assert "AUTHORITATIVE ANALYSIS" in prompt
 
 
 def test_generate_strips_section_code_fences(tmp_path, monkeypatch) -> None:

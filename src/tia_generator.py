@@ -41,18 +41,38 @@ recommended configurations). Incorporate the reference material into your
 assessment and flag any customer answers that violate or fall short of the
 reference recommendations.
 
-The full report is produced ONE SECTION AT A TIME. Each request names the single
-section to write — produce ONLY that section's content.
+The report is produced in two phases: first a single CANONICAL ANALYSIS that fixes
+the environment facts and the severity of every finding, then the individual
+sections one at a time. When a block headed "AUTHORITATIVE ANALYSIS" is supplied to
+you, treat it as the SINGLE SOURCE OF TRUTH: reuse its figures and its severity
+ratings verbatim — never re-derive a count or re-rate a finding. Each request names
+the single section to write — produce ONLY that section's content.
+
+Severity scale — use EXACTLY these four levels, with these criteria, consistently
+everywhere a severity appears:
+- Critical: active security exposure or data-loss risk requiring immediate action.
+- High: significant risk to security, performance, or recoverability; remediate soon.
+- Medium: sub-optimal configuration to correct; not urgent.
+- Low: minor or advisory. Compliant items (those needing no action) are NOT findings:
+  do not give them a severity and do not list them among "most significant findings".
+
+Version currency: the customer workbook's version table lists only versions known
+when it was authored; its newest row is NOT necessarily the latest Blue Prism
+release. Judge product currency against the installation-guide / reference material
+(e.g. the Blue Prism 7.x line) and treat the workbook's version list purely as a
+known-bad-version lookup. Never call a version "current" merely because it is the
+newest row in the workbook.
 
 Output requirements:
 - Markdown ONLY. No preamble, no sign-off, no document title. Do not wrap the
   output in a code fence.
 - Begin with the exact level-2 heading given for the requested section, then its
   content. Use level-3 (###) headings for any subsections.
-- Be concrete: name specific systems, versions, counts, hostnames where given.
+- Be concrete: name specific systems, versions, counts where given.
 - Use bullet lists, short paragraphs, and tables where they aid readability.
 - Do NOT invent values. Where the customer data is missing or ambiguous, say so
-  explicitly within the relevant section.
+  explicitly. Never assume a default the data does not state (e.g. a log retention
+  period).
 - Do not produce content belonging to other sections.
 """
 
@@ -75,11 +95,16 @@ class TiaReportGenerator:
         ("Executive Summary",
          "Give a concise overview of the environment's scale (Blue Prism version, "
          "Runtime Resource / App Server / Interactive Client counts, scale tier, "
-         "virtualisation) and the most significant findings as a short bulleted list."),
+         "virtualisation), using the Environment Facts from the authoritative "
+         "analysis verbatim. Then list the most significant findings as a short "
+         "bulleted list drawn from the Findings Ledger, highest-severity first. Do "
+         "NOT include compliant items in that list, and do not mark any item rated "
+         "Medium or above as a positive/✅."),
         ("Servers (SQL / App / Runtime)",
          "Assess the Database/SQL Server, Application Servers, and Runtime Resources: "
          "platform, scale-tier specs, dedication, connection security, backups, "
-         "statistics, index maintenance, encryption-key location, authentication."),
+         "statistics, index maintenance, encryption-key location, authentication. "
+         "Use the ledger's severity for each item."),
         ("Interactive Clients",
          "Assess the Interactive Clients: counts, platform, and any mirroring/build "
          "differences between development clients and production Runtime Resources."),
@@ -89,17 +114,23 @@ class TiaReportGenerator:
         ("Security",
          "Summarise the security posture as a table (Area, Status, Severity) covering "
          "SQL connection encryption, encryption-key location, Runtime Resource "
-         "authentication, SQL dedication, and any unanswered security questions."),
+         "authentication, SQL dedication, and any unanswered security questions. Take "
+         "the Severity column straight from the Findings Ledger."),
         ("General Environment",
          "Assess session logging (level, archiving, Data Gateways, Unicode) and the "
          "process/object estate, relating volume to database-load risk."),
         ("Findings & Recommendations",
-         "Produce a single prioritised findings table with columns: #, Area, Finding, "
-         "Severity, Recommendation. Order by severity (High first)."),
+         "Render the Findings Ledger from the authoritative analysis as a single "
+         "prioritised table (columns: #, Area, Finding, Severity, Recommendation), "
+         "ordered by severity (Critical first). Use the ledger's severities verbatim — "
+         "do not change or re-rate them."),
         ("Outstanding Questions",
          "List every customer question that was unanswered, blank, or ambiguous in the "
          "data, grouped by area. Do NOT invent answers — only list what needs clarifying."),
     )
+
+    # Label for the internal phase-1 call (not emitted as a report section).
+    ANALYSIS_LABEL = "Canonical analysis"
 
     # If a section's completion_tokens lands at/above this, the gateway very
     # likely truncated it at its ~4096-token ceiling — warn the operator.
@@ -144,14 +175,28 @@ class TiaReportGenerator:
 
         data_block = self._build_user_message(customer_content)
 
-        # Generate each section in its own RAG call (the endpoint caps output
-        # near ~4096 tokens, so a single all-in-one call truncates).
+        # Phase 1 — canonical analysis: fix the environment facts and the severity
+        # of every finding ONCE. Because the report's sections are generated as
+        # independent RAG calls (each stays under the gateway's ~4096-token output
+        # cap), they would otherwise drift — different Runtime Resource counts,
+        # different severities for the same issue, contradictory version verdicts.
+        # Anchoring every section to this single analysis eliminates that drift.
+        logger.info("TIA analysis pass: %s", self.ANALYSIS_LABEL)
+        analysis = self._strip_code_fence(
+            self._call_rag_chat(
+                data_block + self._analysis_directive(),
+                section=self.ANALYSIS_LABEL,
+            )
+        ).strip()
+        canonical = self._canonical_block(analysis)
+
+        # Phase 2 — render each section from the shared analysis.
         section_texts: list[str] = []
         for i, (title, hint) in enumerate(self.REPORT_SECTIONS, start=1):
             logger.info(
                 "TIA section %d/%d: %s", i, len(self.REPORT_SECTIONS), title,
             )
-            message = data_block + self._section_directive(title, hint)
+            message = data_block + canonical + self._section_directive(title, hint)
             section_md = self._call_rag_chat(message, section=title)
             section_texts.append(self._strip_code_fence(section_md).strip())
 
@@ -190,12 +235,49 @@ class TiaReportGenerator:
         )
 
     @staticmethod
+    def _analysis_directive() -> str:
+        """Phase-1 instruction. Produces the canonical facts + severity-rated
+        findings ledger that every section then renders from, so the
+        independently-generated sections share one set of numbers and ratings."""
+        return (
+            "\nThis is the CANONICAL ANALYSIS phase — do NOT write report prose or a "
+            "document section. Produce one compact reference block, exactly these two "
+            "parts:\n\n"
+            "## Environment Facts\n"
+            "A short table of the headline facts (Blue Prism version, scale tier, "
+            "Runtime Resource count, Application Server count, Interactive Client "
+            "count, process/object count, platforms). Where the data gives more than "
+            "one value for a figure, choose ONE operative value, show it, and note the "
+            "discrepancy once here so later sections do not have to decide.\n\n"
+            "## Findings Ledger\n"
+            "A table with columns: ID | Area | Severity | Finding | Recommendation. "
+            "One row per material issue derived from the customer answers, each rated "
+            "with the four-level severity scale from the system prompt, ordered by "
+            "severity (Critical first). Do NOT include compliant items. Keep each cell "
+            "to one concise sentence.\n"
+        )
+
+    @staticmethod
+    def _canonical_block(analysis: str) -> str:
+        """Wrap the phase-1 analysis as the authoritative context injected into
+        every section call."""
+        return (
+            "\n\n=== AUTHORITATIVE ANALYSIS (single source of truth — reuse its "
+            "figures and severities verbatim; do NOT re-derive counts or re-rate "
+            "findings) ===\n"
+            f"{analysis}\n"
+            "=== END AUTHORITATIVE ANALYSIS ===\n"
+        )
+
+    @staticmethod
     def _section_directive(title: str, hint: str) -> str:
         """The per-section instruction appended to the shared data block. Tells
         the model to produce ONLY the named section, starting with its heading."""
         return (
             f"\nWrite ONLY the \"{title}\" section of the assessment. "
             f"Begin with this exact heading line:\n\n## {title}\n\n{hint}\n"
+            "Reuse the figures and severity ratings from the authoritative analysis "
+            "above exactly; do not re-derive counts or re-rate findings.\n"
         )
 
     @staticmethod
