@@ -15,37 +15,27 @@ flow per file:
           `tia_reference` tag the xlsx extractions use.
        c. On success, move the file to REFERENCE_LOADED_DIR
           (replacing any stale copy with the same basename).
-       d. On RAG failure, leave the file in the inbox for next-run
-          retry; stage rc becomes 1 but the loop continues.
+       d. On a per-file RAG rejection, leave the file in the inbox for
+          next-run retry; stage rc becomes 1 but the loop continues.
+          If the gateway is unreachable (connection error / timeout),
+          abort the stage instead — every remaining file would fail the
+          same way, each paying the retry/backoff cost for nothing.
 
-Can be run directly (python src\\reference_passthrough_ingester.py)
-for isolated testing, or imported by run.py.
+`ingest()` is imported and driven by run.py.
 """
 
 from __future__ import annotations
 
 import logging
 import os
-import shutil
 from pathlib import Path
 
-import requests
-
-from logging_setup import bootstrap
+from excel_to_json import move_replacing
+from http_resilient import TRANSIENT_ERRORS
 from rag_ingester import RagGatewayError, RagIngester
 
 
 PASSTHROUGH_PATTERNS: tuple[str, ...] = ("*.pdf",)
-
-
-REQUIRED_ENV_VARS = (
-    "SSC_CLOUD_AIGATEWAY_BASE_URL",
-    "SSC_CLOUD_AIGATEWAY_API_KEY",
-    "SSC_CLOUD_AIGATEWAY_MODEL",
-    "REFERENCE_TO_BE_LOADED_DIR",
-    "REFERENCE_LOADED_DIR",
-    "LOG_DIR",
-)
 
 
 logger = logging.getLogger(__name__)
@@ -86,7 +76,7 @@ def ingest(rag: RagIngester) -> int:
     rag_inventory: dict[str, list[str]] = {}
     try:
         entries = rag.list_files()
-    except (RagGatewayError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+    except (RagGatewayError, *TRANSIENT_ERRORS) as exc:
         logger.error("Cannot list RAG files; aborting passthrough stage: %s", exc)
         return 1
     if isinstance(entries, list):
@@ -117,7 +107,14 @@ def ingest(rag: RagIngester) -> int:
                     prior_id, basename,
                 )
                 rag.delete_file_id(prior_id)
-            except (RagGatewayError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            except TRANSIENT_ERRORS as exc:
+                logger.error(
+                    "Gateway unreachable deleting prior entry for %s; aborting "
+                    "passthrough stage (remaining files stay in inbox): %s",
+                    basename, exc,
+                )
+                return 1
+            except RagGatewayError as exc:
                 logger.error(
                     "Cannot delete prior RAG entry %s for %s: %s",
                     prior_id, basename, exc,
@@ -131,21 +128,20 @@ def ingest(rag: RagIngester) -> int:
 
         try:
             rag.ingest_file(src, tags=["tia_reference"])
-        except (RagGatewayError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        except TRANSIENT_ERRORS as exc:
+            logger.error(
+                "Gateway unreachable uploading %s; aborting passthrough stage "
+                "(remaining files stay in inbox): %s", basename, exc,
+            )
+            return 1
+        except RagGatewayError as exc:
             logger.error("passthrough upload FAILED for %s: %s", basename, exc)
             n_failed += 1
             continue
 
-        # Use shutil.move so cross-volume moves (e.g. inbox on local C:,
-        # LOADED on a mapped network drive) fall back to copy+unlink
-        # instead of OSError-ing the way Path.replace() would. Delete any
-        # stale destination first so shutil.move's cross-volume fallback
-        # doesn't refuse to overwrite.
         target = loaded_dir / basename
         try:
-            if target.exists():
-                target.unlink()
-            shutil.move(str(src), str(target))
+            move_replacing(src, target)
         except OSError as exc:
             logger.error(
                 "passthrough move FAILED for %s (uploaded to RAG, "
@@ -167,16 +163,3 @@ def ingest(rag: RagIngester) -> int:
         n_uploaded, n_overwritten, n_failed,
     )
     return 1 if n_failed else 0
-
-
-if __name__ == "__main__":
-    rc = bootstrap(REQUIRED_ENV_VARS)
-    if rc is not None:
-        raise SystemExit(rc)
-    ingester = RagIngester(
-        base_url=os.environ["SSC_CLOUD_AIGATEWAY_BASE_URL"],
-        api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
-        llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
-    )
-    print("=== reference_passthrough_ingester (standalone) ===")
-    raise SystemExit(ingest(ingester))

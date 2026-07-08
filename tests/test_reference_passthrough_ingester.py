@@ -163,6 +163,36 @@ def test_partial_failure_sets_rc_1_other_files_proceed(env_dirs) -> None:
     assert not (loaded / "b.pdf").exists()
 
 
+def test_gateway_down_aborts_stage_before_remaining_files(env_dirs) -> None:
+    """A ConnectionError (gateway unreachable) aborts the whole stage instead
+    of burning the retry/backoff cost on every remaining file. Per-file
+    RagGatewayError rejections still continue the loop (see
+    test_partial_failure_sets_rc_1_other_files_proceed)."""
+    import requests
+
+    inbox, loaded = env_dirs
+    (inbox / "a.pdf").write_bytes(b"x")
+    (inbox / "b.pdf").write_bytes(b"y")
+
+    class _Down(_StubRag):
+        def __init__(self) -> None:
+            super().__init__(listing=[])
+            self.attempts: list[str] = []
+
+        def ingest_file(self, path: Path, tags=None, **_):
+            self.attempts.append(Path(path).name)
+            raise requests.exceptions.ConnectionError("gateway down")
+
+    rag = _Down()
+    rc = rpi.ingest(rag)
+
+    assert rc == 1
+    assert rag.attempts == ["a.pdf"]                # b.pdf never attempted
+    assert (inbox / "a.pdf").exists()               # both stay in inbox
+    assert (inbox / "b.pdf").exists()
+    assert not any(loaded.iterdir())                # nothing moved
+
+
 def test_non_pattern_files_are_ignored(env_dirs) -> None:
     inbox, loaded = env_dirs
     (inbox / "ignored.xlsx").write_bytes(b"x")  # handled by Excel stage, not us

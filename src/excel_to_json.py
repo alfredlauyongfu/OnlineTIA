@@ -1,8 +1,12 @@
-"""Convert every .xlsx / .xlsm file in an input folder to JSON in an output folder.
+"""Stage customer input files from an input folder into JSON in an output folder.
 
-Each sheet of a workbook is written as its own JSON file named
-`{workbook_stem}__{sheet_name}.json`, containing a list of row objects.
-The first non-empty row of each sheet is treated as the header row.
+Two input formats are supported (see CUSTOMER_INPUT_PATTERNS):
+  - Excel workbooks (.xlsx/.xlsm): each sheet is written as its own JSON file
+    named `{workbook_stem}__{sheet_name}.json`, containing a list of row
+    objects. The first non-empty row of each sheet is treated as the header.
+  - JSON form exports (.json): validated (must parse as a JSON object;
+    a UTF-8 BOM is tolerated) and re-serialized into the output folder
+    under the same basename.
 
 Lifecycle of a source file when `processing_dir` and `processed_dir` are set:
   input_dir  -> (claim)   -> processing_dir
@@ -24,10 +28,25 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
-from openpyxl.cell.cell import Cell
 
 
 logger = logging.getLogger(__name__)
+
+
+# Customer inputs may be Excel workbooks (converted per-sheet) or JSON form
+# exports (validated + staged as-is). The reference stage stays xlsx-only —
+# see `list_workbooks`.
+CUSTOMER_INPUT_PATTERNS: tuple[str, ...] = ("*.xls[xm]", "*.json")
+
+
+def move_replacing(src: Path, dst: Path) -> None:
+    """Move `src` to `dst`, replacing any stale `dst`. shutil.move handles
+    cross-volume moves (e.g. local C: to a mapped network drive) by falling
+    back to copy+unlink where Path.replace() would raise OSError; deleting a
+    stale target first keeps that fallback from refusing to overwrite."""
+    if dst.exists():
+        dst.unlink()
+    shutil.move(str(src), str(dst))
 
 
 class ExcelToJsonConverter:
@@ -72,55 +91,90 @@ class ExcelToJsonConverter:
         logger.info("wiped %d file(s) from %s", wiped, self.output_dir)
         return wiped
 
-    def process_one(self, xlsx: Path) -> bool:
-        """Process a single xlsx end-to-end: claim source to processing_dir
-        (when move-mode), read the workbook, write per-sheet JSONs into
-        output_dir, and record the source in successfully_processed_paths for
-        later finalize_to_processed_dir().
+    def process_one(self, source: Path) -> bool:
+        """Stage a single customer input end-to-end: claim it to
+        processing_dir (when move-mode), then either convert an Excel
+        workbook to per-sheet JSONs or validate-and-stage a JSON form export
+        into output_dir, recording the source in successfully_processed_paths
+        for later finalize_to_processed_dir().
 
         Does NOT wipe output_dir — the caller is responsible for that. Use
         wipe_output() before each process_one() call if you need output_dir
-        to contain only this one file's sheets at a time.
+        to contain only this one file's artifacts at a time.
 
-        Returns True on success, False on conversion failure (already logged).
+        Returns True on success, False on staging failure (already logged).
         """
         self.output_dir.mkdir(parents=True, exist_ok=True)
         if self._moves_sources:
             self.processing_dir.mkdir(parents=True, exist_ok=True)
             self.processed_dir.mkdir(parents=True, exist_ok=True)
-            source = self.processing_dir / xlsx.name
-            # When processing_dir == input_dir, source == xlsx and the rename
-            # would be a no-op (or platform-dependent error). Skip it.
-            # shutil.move handles cross-volume falls back to copy+unlink.
-            if source != xlsx:
-                shutil.move(str(xlsx), str(source))
+            claimed = self.processing_dir / source.name
+            # When processing_dir == input_dir, claimed == source and the
+            # move would be a no-op (or platform-dependent error). Skip it.
+            if claimed != source:
+                move_replacing(source, claimed)
         else:
-            source = xlsx
+            claimed = source
 
+        if claimed.suffix.lower() == ".json":
+            written = self._stage_json(claimed)
+        else:
+            written = self._convert_excel(claimed)
+        if written is None:
+            return False
+
+        files_msg = ", ".join(written) or "(no sheets)"
+        if self._moves_sources:
+            self.successfully_processed_paths.append(claimed)
+            logger.info(
+                "%s -> %s (held in %s, pending finalize)",
+                source.name, files_msg, claimed.parent.name,
+            )
+        else:
+            logger.info("%s -> %s", source.name, files_msg)
+        return True
+
+    def _convert_excel(self, source: Path) -> list[str] | None:
+        """Excel branch of process_one: workbook → one JSON per sheet in
+        output_dir. Returns the written filenames, or None on failure."""
         try:
             data = self.convert_workbook(source)
         except Exception as exc:
             suffix = f" (left in {source})" if self._moves_sources else ""
-            logger.error("FAILED %s: %s%s", xlsx.name, exc, suffix)
-            return False
+            logger.error("FAILED %s: %s%s", source.name, exc, suffix)
+            return None
 
         written: list[str] = []
         for sheet_name, records in data.items():
-            target = self.output_dir / f"{xlsx.stem}__{self.safe_name(sheet_name)}.json"
+            target = self.output_dir / f"{source.stem}__{self.safe_name(sheet_name)}.json"
             with target.open("w", encoding="utf-8") as f:
                 json.dump(records, f, ensure_ascii=False, indent=2)
             written.append(target.name)
+        return written
 
-        files_msg = ", ".join(written) or "(no sheets)"
-        if self._moves_sources:
-            self.successfully_processed_paths.append(source)
-            logger.info(
-                "%s -> %s (held in %s, pending finalize)",
-                xlsx.name, files_msg, source.parent.name,
-            )
-        else:
-            logger.info("%s -> %s", xlsx.name, files_msg)
-        return True
+    def _stage_json(self, source: Path) -> list[str] | None:
+        """JSON branch of process_one: validate the form export (must parse
+        as a JSON object; utf-8-sig tolerates a BOM) and re-serialize it into
+        output_dir under the same basename. Re-serializing — not copying —
+        guarantees the staged file is plain UTF-8 and exactly what was
+        validated, which is what the TIA generator's reader expects.
+        Returns the written filename, or None on failure."""
+        try:
+            with source.open("r", encoding="utf-8-sig") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"expected a JSON object, got {type(payload).__name__}"
+                )
+        except Exception as exc:
+            suffix = f" (left in {source})" if self._moves_sources else ""
+            logger.error("FAILED %s: %s%s", source.name, exc, suffix)
+            return None
+
+        target = self.output_dir / source.name
+        with target.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        return [target.name]
 
     def convert_folder(self) -> int:
         """Batch-process every .xls[xm] in input_dir. Wipes output_dir once
@@ -138,9 +192,7 @@ class ExcelToJsonConverter:
         if self.clean_output_first:
             self.wipe_output()
 
-        source_files = sorted(
-            p for p in self.input_dir.glob("*.xls[xm]") if not p.name.startswith("~$")
-        )
+        source_files = self.list_workbooks(self.input_dir)
         if not source_files:
             logger.info("No .xlsx/.xlsm files found in %s", self.input_dir)
             return 0
@@ -190,12 +242,7 @@ class ExcelToJsonConverter:
                 continue
             target = self.processed_dir / src.name
             try:
-                # shutil.move handles cross-volume fallback to copy+unlink.
-                # Delete a stale target first so the fallback won't refuse
-                # to overwrite.
-                if target.exists():
-                    target.unlink()
-                shutil.move(str(src), str(target))
+                move_replacing(src, target)
             except Exception as exc:
                 logger.error("finalize FAILED for %s: %s", src.name, exc)
                 continue
@@ -212,6 +259,34 @@ class ExcelToJsonConverter:
         cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("_")
         return cleaned or "sheet"
 
+    @staticmethod
+    def list_workbooks(dir_path: Path) -> list[Path]:
+        """Every .xlsx/.xlsm in `dir_path` (sorted), excluding Office `~$`
+        lock/temp files. A missing directory yields [] — callers keep their
+        own policy for that case."""
+        return sorted(
+            p for p in dir_path.glob("*.xls[xm]") if not p.name.startswith("~$")
+        )
+
+    @staticmethod
+    def list_customer_inputs(dir_path: Path) -> list[Path]:
+        """Every customer input file in `dir_path` (sorted) matching any of
+        CUSTOMER_INPUT_PATTERNS, excluding Office `~$` lock/temp files."""
+        return sorted(
+            p
+            for pattern in CUSTOMER_INPUT_PATTERNS
+            for p in dir_path.glob(pattern)
+            if not p.name.startswith("~$")
+        )
+
+    @staticmethod
+    def sheet_name_from_path(path: Path) -> str:
+        """Inverse of the `{workbook_stem}__{sheet_name}.json` naming this
+        converter writes: the sheet part after the FIRST `__`, or the whole
+        stem when the separator is absent."""
+        stem = path.stem
+        return stem.split("__", 1)[1] if "__" in stem else stem
+
     def convert_workbook(self, path: Path) -> dict[str, list[dict[str, Any]]]:
         """Read an .xlsx/.xlsm at `path` and return
         `{sheet_name: [row_dict, ...]}`. Each row dict drops cells whose
@@ -227,8 +302,8 @@ class ExcelToJsonConverter:
         headers: list[str] | None = None
         records: list[dict[str, Any]] = []
 
-        for row in sheet.iter_rows(values_only=False):
-            values = [self._cell_value(c) for c in row]
+        for row in sheet.iter_rows(values_only=True):
+            values = [self._json_value(v) for v in row]
             if headers is None:
                 if all(v is None or v == "" for v in values):
                     continue
@@ -252,8 +327,8 @@ class ExcelToJsonConverter:
         return records
 
     @staticmethod
-    def _cell_value(cell: Cell) -> Any:
-        value = cell.value
+    def _json_value(value: Any) -> Any:
+        """Cell value → JSON-serializable value (date/time ISO-serialized)."""
         if isinstance(value, (dt.datetime, dt.date, dt.time)):
             return value.isoformat()
         return value

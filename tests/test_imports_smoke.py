@@ -15,8 +15,8 @@ def test_import_logging_setup() -> None:
     import logging_setup  # noqa: F401
 
 
-def test_import_reference_json_combiner() -> None:
-    import reference_json_combiner  # noqa: F401
+def test_import_reference_sheet_extractor() -> None:
+    import reference_sheet_extractor  # noqa: F401
 
 
 def test_import_reference_info_extractor() -> None:
@@ -39,17 +39,31 @@ def test_import_run() -> None:
     import run  # noqa: F401
 
 
-def test_required_vars_all_include_log_dir() -> None:
-    """Bootstrap requires LOG_DIR — every entry point's REQUIRED_VARS
-    tuple must include it, else logging-config will KeyError at runtime."""
+def test_run_required_vars_cover_every_stage_var() -> None:
+    """run.py is the single entry point and the only bootstrap: every env var
+    any stage dereferences must be in its REQUIRED_VARS, else a missing var
+    surfaces as a KeyError traceback mid-run instead of bootstrap's clean
+    exit-2 (and LOG_DIR must be present for logging-config itself)."""
     import run
-    import reference_info_extractor
-    import reference_passthrough_ingester
-    import rag_ingester
-    import tia_generator
 
-    assert "LOG_DIR" in run.REQUIRED_VARS
-    assert "LOG_DIR" in reference_info_extractor.REQUIRED_ENV_VARS
-    assert "LOG_DIR" in reference_passthrough_ingester.REQUIRED_ENV_VARS
-    assert "LOG_DIR" in rag_ingester.REQUIRED_ENV_VARS
-    assert "LOG_DIR" in tia_generator.REQUIRED_ENV_VARS
+    stage_vars = {
+        # bootstrap / logging
+        "LOG_DIR",
+        # gateway auth (extraction + RAG + TIA stages)
+        "SSC_CLOUD_AIGATEWAY_BASE_URL",
+        "SSC_CLOUD_AIGATEWAY_API_KEY",
+        "SSC_CLOUD_AIGATEWAY_USER_ID",
+        "SSC_CLOUD_AIGATEWAY_MODEL",
+        "USE_CASE_ID",
+        # reference pipeline dirs
+        "REFERENCE_TO_BE_LOADED_DIR",
+        "REFERENCE_LOADED_DIR",
+        "REFERENCE_JSON_DIR",
+        # primary + TIA pipeline dirs
+        "INPUT_DIR",
+        "INTERMEDIATE_JSON_DIR",
+        "PROCESSING_DIR",
+        "PROCESSED_DIR",
+        "OUTPUT_REPORT_DIR",
+    }
+    assert stage_vars <= set(run.REQUIRED_VARS)

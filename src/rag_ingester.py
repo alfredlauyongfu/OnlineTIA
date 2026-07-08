@@ -8,10 +8,7 @@ Each file goes through two HTTP POSTs against the AI Gateway RAG API:
 
 Auth is via the `X-API-Key` header (reuses SSC_CLOUD_AIGATEWAY_API_KEY).
 
-This module is standalone — instantiating callers wire `RagIngester` in
-themselves. A bottom-of-file `main()` test harness lets you ingest every
-`extracted_*.json` file in REFERENCE_JSON_DIR with
-`python src\rag_ingester.py`.
+Instantiating callers wire `RagIngester` in themselves (see run.py).
 """
 
 from __future__ import annotations
@@ -19,14 +16,19 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
-import sys
 from pathlib import Path
 from typing import Any
 
 import requests
 
-from logging_setup import bootstrap
+from http_resilient import (
+    CONNECT_TIMEOUT,
+    READ_TIMEOUT,
+    TRANSIENT_ERRORS,
+    call_resilient,
+    parse_json,
+    raise_for_status,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -52,7 +54,7 @@ class RagIngester:
         base_url: str,
         api_key: str,
         llm_model: str,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = READ_TIMEOUT,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
@@ -71,22 +73,19 @@ class RagIngester:
 
         logger.info("RAG listfiles start: GET %s", url)
         try:
-            response = requests.get(url, headers=headers, timeout=self.timeout_seconds)
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            response = call_resilient(
+                lambda: requests.get(
+                    url, headers=headers,
+                    timeout=(CONNECT_TIMEOUT, self.timeout_seconds),
+                ),
+                label="rag listfiles",
+                read_timeout=self.timeout_seconds,
+            )
+        except TRANSIENT_ERRORS as exc:
             logger.error("RAG listfiles FAILED (gateway): %s", exc)
             raise
         self._raise_for_status(response, "listfiles")
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            logger.error(
-                "RAG listfiles FAILED: bad JSON: %s; body=%s",
-                exc, response.text[:500],
-            )
-            raise RagGatewayError(
-                f"listfiles non-JSON response: {response.text[:500]}"
-            )
+        payload = parse_json(response, label="listfiles", error_cls=RagGatewayError)
 
         # Count first (always visible). At INFO level the log gets only the
         # list of file names. At DEBUG level it also gets the full structured
@@ -183,9 +182,10 @@ class RagIngester:
             and self._entry_has_tags(e, tags)
         ]
 
-        # basename -> file_id for our owned RAG entries. If duplicates exist
-        # (shouldn't, but defend against it) the last one wins; the others
-        # become stale during the set-difference pass below.
+        # basename -> file_id for our owned RAG entries. If duplicate basenames
+        # exist (e.g. a hard-capped upload attempt that still completed
+        # server-side, then was retried) the last one wins; the losers are
+        # collected as duplicates below and deleted alongside the stale set.
         rag_by_name: dict[str, str] = {
             Path(e["file_name"]).name: e["file_id"] for e in owned_entries
         }
@@ -198,7 +198,16 @@ class RagIngester:
         to_upload = local_names - rag_names
         unchanged = local_names & rag_names
 
-        if not to_delete and not to_upload:
+        # Duplicate owned entries: same basename as a kept local file but a
+        # different file_id than the one kept in rag_by_name. Left alone they
+        # would feed duplicate chunks into every RAG retrieval, forever.
+        dup_file_ids: list[str] = [
+            e["file_id"] for e in owned_entries
+            if Path(e["file_name"]).name in local_names
+            and e["file_id"] != rag_by_name[Path(e["file_name"]).name]
+        ]
+
+        if not to_delete and not to_upload and not dup_file_ids:
             logger.info(
                 "RAG sync OK: %d local file(s) match %d uploaded file(s); skipping upload",
                 len(local_names), len(rag_names),
@@ -206,20 +215,20 @@ class RagIngester:
             return {name: rag_by_name[name] for name in unchanged}
 
         logger.info(
-            "RAG sync: delete %d stale, upload %d new, keep %d unchanged",
-            len(to_delete), len(to_upload), len(unchanged),
+            "RAG sync: delete %d stale + %d duplicate, upload %d new, keep %d unchanged",
+            len(to_delete), len(dup_file_ids), len(to_upload), len(unchanged),
         )
 
-        # Delete only stale entries — and clean up any extra owned-by-tag
-        # entries that share a basename we're keeping (defensive dedup).
+        # Delete stale entries plus the duplicate owned entries that share a
+        # basename we're keeping.
         stale_file_ids: list[str] = [
             e["file_id"] for e in owned_entries
             if Path(e["file_name"]).name in to_delete
-        ]
+        ] + dup_file_ids
         for file_id in stale_file_ids:
             try:
                 self._delete_one(file_id)
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            except TRANSIENT_ERRORS as exc:
                 # Gateway dropped mid-delete: stop trying to delete; the
                 # subsequent ingest will also fail fast.
                 logger.error("Gateway unreachable mid-delete: %s", exc)
@@ -240,7 +249,7 @@ class RagIngester:
                     rag_config_overrides=rag_config_overrides,
                     force_update=force_update,
                 )
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            except TRANSIENT_ERRORS as exc:
                 # Gateway-level failure: don't keep hammering it.
                 logger.error("Gateway unreachable, aborting directory ingest: %s", exc)
                 raise RagGatewayError(f"Gateway unreachable: {exc}") from exc
@@ -292,18 +301,9 @@ class RagIngester:
 
     @staticmethod
     def _raise_for_status(response: requests.Response, label: str) -> None:
-        """If the HTTP response isn't 2xx, log + raise `RagGatewayError`.
-        `label` is embedded in both the log line and the exception message.
-        """
-        if response.ok:
-            return
-        logger.error(
-            "RAG %s FAILED: HTTP %d: %s",
-            label, response.status_code, response.text[:500],
-        )
-        raise RagGatewayError(
-            f"{label} HTTP {response.status_code}: {response.text[:500]}"
-        )
+        """Non-2xx → `RagGatewayError` via the shared helper; `label` is
+        embedded in both the log line and the exception message."""
+        raise_for_status(response, label=label, error_cls=RagGatewayError)
 
     def _post_json(
         self, endpoint: str, body: dict[str, Any], label: str
@@ -317,10 +317,15 @@ class RagIngester:
         url = f"{self.base_url}{endpoint}"
         headers = {"Content-Type": "application/json", "X-API-Key": self.api_key}
         try:
-            response = requests.post(
-                url, headers=headers, json=body, timeout=self.timeout_seconds
+            response = call_resilient(
+                lambda: requests.post(
+                    url, headers=headers, json=body,
+                    timeout=(CONNECT_TIMEOUT, self.timeout_seconds),
+                ),
+                label=f"rag {label}",
+                read_timeout=self.timeout_seconds,
             )
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+        except TRANSIENT_ERRORS as exc:
             logger.error("RAG %s FAILED (gateway): %s", label, exc)
             raise
         self._raise_for_status(response, label)
@@ -369,54 +374,30 @@ class RagIngester:
         label = f"upload {file_path.name}"
 
         logger.info("RAG upload start (one-shot): %s (file_id=%s)", file_path.name, file_id)
-        try:
+
+        def _do_upload():
+            # Open the file FRESH on each attempt — a consumed handle can't be
+            # re-read if call_resilient retries. file_end="true" marks the
+            # complete file (not part of a chunked stream); sent as a string
+            # because multipart form fields are strings.
             with file_path.open("rb") as fh:
-                # file_end="true" marks this as the complete file (not part of
-                # a chunked stream). Sent as a string because multipart form
-                # fields are strings; the gateway parses "true"/"false" itself.
-                response = requests.post(
+                return requests.post(
                     url,
                     headers=headers,
                     data={"file_id": file_id, "file_end": "true"},
                     files={"file": (file_path.name, fh)},
-                    timeout=self.timeout_seconds,
+                    timeout=(CONNECT_TIMEOUT, self.timeout_seconds),
                 )
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+
+        try:
+            response = call_resilient(
+                _do_upload, label=f"rag {label}", read_timeout=self.timeout_seconds,
+            )
+        except TRANSIENT_ERRORS as exc:
             logger.error("RAG %s FAILED (gateway): %s", label, exc)
             raise
         self._raise_for_status(response, label)
-        # The gateway chunks + vectorizes during upload processing, so the
-        # chunk count (if reported) appears on THIS response, not on register.
-        num_chunks = self._extract_chunk_count(response)
-        if num_chunks is not None:
-            logger.info(
-                "RAG upload OK: %s (file_id=%s, num_chunks=%s)",
-                file_path.name, file_id, num_chunks,
-            )
-        else:
-            logger.info("RAG upload OK: %s (file_id=%s)", file_path.name, file_id)
-
-    @staticmethod
-    def _extract_chunk_count(response: Any) -> int | None:
-        """Best-effort: pull a chunk count out of a gateway response. The
-        gateway reports it under one of a few possible field names (and only
-        once vectorization has run), so this returns None when absent or when
-        the body isn't JSON."""
-        try:
-            payload = response.json()
-        except (ValueError, AttributeError):
-            return None
-        if not isinstance(payload, dict):
-            return None
-        for key in ("num_chunks", "chunk_count", "n_chunks", "chunks"):
-            v = payload.get(key)
-            if isinstance(v, bool):  # guard: bools are ints in Python
-                continue
-            if isinstance(v, int):
-                return v
-            if isinstance(v, list):
-                return len(v)
-        return None
+        logger.info("RAG upload OK: %s (file_id=%s)", file_path.name, file_id)
 
     def _delete_one(self, file_id: str) -> None:
         """POST /rag/ingest/delete with {'file_id': file_id}.
@@ -435,77 +416,3 @@ class RagIngester:
     def delete_file_id(self, file_id: str) -> None:
         """Public alias for `_delete_one`. Use this from outside the class."""
         self._delete_one(file_id)
-
-
-# ---- standalone test harness ----
-#
-# Run directly to ingest every extracted_*.json file in REFERENCE_JSON_DIR:
-#   & C:\blueprism\OnlineTIA\.venv\Scripts\python.exe C:\blueprism\OnlineTIA\src\rag_ingester.py
-#
-# Requires the per-sheet extracted files to already exist (run
-# reference_info_extractor.py first).
-
-REQUIRED_ENV_VARS = (
-    "SSC_CLOUD_AIGATEWAY_BASE_URL",
-    "SSC_CLOUD_AIGATEWAY_API_KEY",
-    "SSC_CLOUD_AIGATEWAY_MODEL",
-    "REFERENCE_JSON_DIR",
-    "LOG_DIR",
-)
-
-
-def main() -> int:
-    rc = bootstrap(REQUIRED_ENV_VARS)
-    if rc is not None:
-        return rc
-
-    reference_json_dir = Path(os.environ["REFERENCE_JSON_DIR"])
-    if not any(reference_json_dir.glob("extracted_*.json")):
-        print(
-            f"No extracted_*.json files in {reference_json_dir}\n"
-            f"Run reference_info_extractor.py first to populate it.",
-            file=sys.stderr,
-        )
-        return 1
-
-    ingester = RagIngester(
-        base_url=os.environ["SSC_CLOUD_AIGATEWAY_BASE_URL"],
-        api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
-        llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
-    )
-
-    print("=== rag_ingester (standalone test) ===")
-    print(f"  source dir : {reference_json_dir} (extracted_*.json only)")
-    print(f"  endpoint   : {ingester.base_url}/rag/ingest/(listfiles|register|upload)")
-    print(f"  model      : {ingester.llm_model}")
-
-    # Pre-flight: list what's already in the RAG store. Logged in full. Treated
-    # as fatal so we don't proceed to ingest if the gateway is unreachable.
-    try:
-        ingester.list_files()
-    except (RagGatewayError, requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
-        print(f"  ABORTED (listfiles): {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        results = ingester.ingest_directory(
-            reference_json_dir,
-            tags=["tia_reference"],
-            glob_pattern="extracted_*.json",
-        )
-    except RagGatewayError as exc:
-        print(f"  ABORTED: {exc}", file=sys.stderr)
-        return 1
-
-    if not results:
-        print("  No files ingested.", file=sys.stderr)
-        return 1
-
-    print(f"  OK ({len(results)} file(s) ingested)")
-    for name, fid in sorted(results.items()):
-        print(f"    {name} -> {fid}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

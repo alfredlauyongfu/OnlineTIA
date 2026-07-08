@@ -14,6 +14,7 @@ import pytest
 import requests
 
 from rag_ingester import RagGatewayError, RagIngester
+from tests.helpers import FakeResponse as _FakeResponse
 
 
 def _make_ingester() -> RagIngester:
@@ -69,20 +70,6 @@ def test_build_rag_config_overrides_apply_last() -> None:
 
 
 # ---------- _raise_for_status ----------
-
-class _FakeResponse:
-    def __init__(self, *, ok: bool = True, status_code: int = 200,
-                 text: str = "", json_body=None):
-        self.ok = ok
-        self.status_code = status_code
-        self.text = text
-        self._json = json_body
-
-    def json(self):
-        if self._json is None:
-            raise ValueError("no json")
-        return self._json
-
 
 def test_raise_for_status_passthrough_on_ok() -> None:
     # No exception, no return value.
@@ -245,6 +232,33 @@ def test_ingest_directory_tag_isolation_ignores_other_use_cases(tmp_path: Path) 
     assert posted_urls.count("https://example.invalid/rag/ingest/delete") == 0
 
 
+def test_ingest_directory_deletes_duplicate_basename_entries(tmp_path: Path) -> None:
+    """Two owned RAG entries share one local basename (e.g. a hard-capped
+    upload attempt that still completed server-side, plus its retry): the kept
+    mapping wins, every other file_id for that basename is deleted, and the
+    file is NOT re-uploaded."""
+    extracted = _make_extracted_dir(tmp_path, ["a.json"])
+    rag_listing = [
+        {"file_id": "fid-old", "file_name": "a.json"},
+        {"file_id": "fid-new", "file_name": r"C:\elsewhere\a.json"},
+    ]
+    ing = _make_ingester()
+    post_calls, fake_post = _make_sync_post()
+
+    with patch("rag_ingester.requests.get",
+               return_value=_FakeResponse(ok=True, status_code=200, json_body=rag_listing)), \
+         patch("rag_ingester.requests.post", side_effect=fake_post):
+        result = ing.ingest_directory(extracted)
+
+    # Last listing entry wins the basename mapping; the duplicate is deleted.
+    assert result == {"a.json": "fid-new"}
+    deleted = [kw["json"]["file_id"] for u, kw in post_calls
+               if u.endswith("/rag/ingest/delete")]
+    assert deleted == ["fid-old"]
+    posted_urls = [u for u, _ in post_calls]
+    assert posted_urls.count("https://example.invalid/rag/ingest/upload") == 0
+
+
 def test_entry_has_tags_helper() -> None:
     has = RagIngester._entry_has_tags
     # No filter → always True
@@ -261,35 +275,8 @@ def test_entry_has_tags_helper() -> None:
     assert has({"tags": "a"}, ["a"]) is False  # not a list
 
 
-def test_extract_chunk_count_reads_known_fields() -> None:
-    extract = RagIngester._extract_chunk_count
-    assert extract(_FakeResponse(json_body={"num_chunks": 42})) == 42
-    assert extract(_FakeResponse(json_body={"chunk_count": 7})) == 7
-    assert extract(_FakeResponse(json_body={"n_chunks": 3})) == 3
-    assert extract(_FakeResponse(json_body={"chunks": [1, 2, 3, 4]})) == 4
-    # Absent / non-int / non-dict / non-JSON / bool → None
-    assert extract(_FakeResponse(json_body={"file_id": "x"})) is None
-    assert extract(_FakeResponse(json_body={"num_chunks": "lots"})) is None
-    assert extract(_FakeResponse(json_body={"num_chunks": True})) is None
-    assert extract(_FakeResponse(json_body=["not", "a", "dict"])) is None
-    assert extract(_FakeResponse(json_body=None)) is None  # .json() raises
-
-
-def test_upload_logs_num_chunks_when_present(tmp_path: Path, caplog) -> None:
-    """_upload_one_shot logs the chunk count when the gateway returns it."""
-    import logging
-    f = tmp_path / "doc.pdf"
-    f.write_bytes(b"%PDF-1.4 fake")
-    ing = _make_ingester()
-    resp = _FakeResponse(ok=True, status_code=200, json_body={"num_chunks": 128})
-    with patch("rag_ingester.requests.post", return_value=resp):
-        with caplog.at_level(logging.INFO):
-            ing._upload_one_shot("fid-1", f)
-    assert any("num_chunks=128" in r.message for r in caplog.records)
-
-
-def test_upload_ok_without_chunk_count(tmp_path: Path, caplog) -> None:
-    """No chunk field → plain OK line, no crash."""
+def test_upload_logs_ok(tmp_path: Path, caplog) -> None:
+    """_upload_one_shot logs an OK line with the file_id after a 2xx upload."""
     import logging
     f = tmp_path / "doc.pdf"
     f.write_bytes(b"%PDF-1.4 fake")
@@ -299,7 +286,6 @@ def test_upload_ok_without_chunk_count(tmp_path: Path, caplog) -> None:
         with caplog.at_level(logging.INFO):
             ing._upload_one_shot("fid-1", f)
     assert any("RAG upload OK" in r.message for r in caplog.records)
-    assert not any("num_chunks" in r.message for r in caplog.records)
 
 
 def test_ingest_directory_empty_returns_empty_dict(tmp_path: Path) -> None:

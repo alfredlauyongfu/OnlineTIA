@@ -1,10 +1,12 @@
 """CLI entry point: run the reference pipeline first (so any new reference
 xlsx gets vectorized into RAG-ready extractions before customer data is
 processed), sync RAG with the latest local extractions, then process every
-.xlsx/.xlsm file in INPUT_DIR **independently and in sequence** — each
-customer file is converted to JSON, then a Technical Infrastructure
-Assessment (TIA) report is generated for that ONE file's data only, then
-the loop moves on to the next customer file. INTERMEDIATE_JSON_DIR is
+customer input file in INPUT_DIR — Excel workbooks (.xlsx/.xlsm) AND JSON
+form exports (.json) — **independently and in sequence**: each customer
+file is staged as JSON (workbooks converted per-sheet, JSON responses
+validated and staged as-is), then a Technical Infrastructure Assessment
+(TIA) report is generated for that ONE file's data only, then the loop
+moves on to the next customer file. INTERMEDIATE_JSON_DIR is
 wiped between files so it never holds content from more than one input
 file at a time, and each TIA report is based on exactly one input file.
 
@@ -15,13 +17,14 @@ Paths owned by this file (read from .env, must be absolute):
   PROCESSED_DIR          - where successfully converted primary files land
   OUTPUT_REPORT_DIR      - where the generated TIA Markdown report is written
 
-The reference stage env vars (REFERENCE_TO_BE_LOADED_DIR / ...) plus
-the AIGateway chat-completions auth (SSC_CLOUD_AIGATEWAY_USER_ID, USE_CASE_ID,
-SSC_CLOUD_AIGATEWAY_BASE_URL) are validated inside reference_info_extractor.py.
+REQUIRED_VARS below is the union of every env var any stage dereferences
+(reference dirs, AIGateway auth, working dirs), so a missing var fails at
+bootstrap instead of surfacing as a KeyError mid-run.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -33,31 +36,59 @@ from pathlib import Path
 # root as the single entry point.
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-import requests
-
 from excel_to_json import ExcelToJsonConverter
+from http_resilient import TRANSIENT_ERRORS
 from logging_setup import bootstrap
 from rag_ingester import RagIngester, RagGatewayError
 from reference_info_extractor import extract as extract_reference_info_stage
-from reference_passthrough_ingester import ingest as ingest_reference_passthrough_stage
+from reference_passthrough_ingester import (
+    PASSTHROUGH_PATTERNS,
+    ingest as ingest_reference_passthrough_stage,
+)
 from tia_generator import TiaReportGenerator, TiaGenerationError
 
 
+# The union of every env var any stage dereferences. run.py is the single
+# entry point, so a var missing from .env must fail here (bootstrap's clean
+# exit-2 message) — not as a KeyError traceback halfway through the run.
 REQUIRED_VARS = (
     "INPUT_DIR",
     "INTERMEDIATE_JSON_DIR",
     "PROCESSING_DIR",
     "PROCESSED_DIR",
+    "REFERENCE_TO_BE_LOADED_DIR",
+    "REFERENCE_LOADED_DIR",
     "REFERENCE_JSON_DIR",
     "OUTPUT_REPORT_DIR",
     "SSC_CLOUD_AIGATEWAY_BASE_URL",
     "SSC_CLOUD_AIGATEWAY_API_KEY",
+    "SSC_CLOUD_AIGATEWAY_USER_ID",
     "SSC_CLOUD_AIGATEWAY_MODEL",
+    "USE_CASE_ID",
     "LOG_DIR",
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def report_prefix(source: Path) -> str:
+    """Filename prefix for the TIA report generated from `source`.
+
+    JSON form exports are named from their "Booking ID" field
+    (`TIA_<bookingid>`); anything else — Excel inputs, a missing/non-string
+    field, an unreadable file — falls back to the sanitized file stem.
+    Never raises: report naming must not be able to fail the run.
+    """
+    if source.suffix.lower() == ".json":
+        try:
+            with source.open("r", encoding="utf-8-sig") as f:
+                booking_id = json.load(f).get("Booking ID")
+            if isinstance(booking_id, str) and booking_id.strip():
+                return f"TIA_{ExcelToJsonConverter.safe_name(booking_id.strip())}"
+        except Exception:
+            pass  # fall through to the stem rule
+    return f"TIA_{ExcelToJsonConverter.safe_name(source.stem)}"
 
 
 def main() -> int:
@@ -70,10 +101,10 @@ def main() -> int:
     # or moves any files. The list also drives whether the per-file TIA
     # stages run.
     input_dir = Path(os.environ["INPUT_DIR"])
-    input_files: list[Path] = sorted(
-        p for p in input_dir.glob("*.xls[xm]")
-        if not p.name.startswith("~$")
-    ) if input_dir.is_dir() else []
+    input_files: list[Path] = (
+        ExcelToJsonConverter.list_customer_inputs(input_dir)
+        if input_dir.is_dir() else []
+    )
 
     primary = ExcelToJsonConverter(
         input_dir=input_dir,
@@ -113,7 +144,7 @@ def main() -> int:
     try:
         loaded_dir = Path(os.environ["REFERENCE_LOADED_DIR"])
         loaded_passthrough = sorted(
-            p for pat in ("*.pdf",) for p in loaded_dir.glob(pat)
+            p for pat in PASSTHROUGH_PATTERNS for p in loaded_dir.glob(pat)
         ) if loaded_dir.is_dir() else []
         rag.ingest_directory(
             Path(os.environ["REFERENCE_JSON_DIR"]),
@@ -121,11 +152,7 @@ def main() -> int:
             glob_pattern="extracted_*.json",
             extra_files=loaded_passthrough,
         )
-    except (
-        RagGatewayError,
-        requests.exceptions.ConnectionError,
-        requests.exceptions.Timeout,
-    ) as exc:
+    except (RagGatewayError, *TRANSIENT_ERRORS) as exc:
         logger.error("RAG sync FAILED: %s", exc)
         rc_rag = 1
     except FileNotFoundError as exc:
@@ -151,45 +178,43 @@ def main() -> int:
             api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
             llm_model=os.environ["SSC_CLOUD_AIGATEWAY_MODEL"],
             output_dir=Path(os.environ["OUTPUT_REPORT_DIR"]),
+            # The extracted per-answer criticality rubric — injected into the
+            # analysis/verification calls so ratings are grounded in the
+            # reference material rather than RAG retrieval luck.
+            reference_guidance_dir=Path(os.environ["REFERENCE_JSON_DIR"]),
         )
         logger.info(
             "--- stage: primary + TIA per file (%d input file(s)) ---",
             len(input_files),
         )
-        for i, xlsx in enumerate(input_files, start=1):
-            logger.info("--- file %d/%d: %s ---", i, len(input_files), xlsx.name)
+        for i, source in enumerate(input_files, start=1):
+            logger.info("--- file %d/%d: %s ---", i, len(input_files), source.name)
 
-            # Wipe intermediate before this file's conversion so it only holds
-            # this file's sheet JSONs.
+            # Report prefix (Booking ID for JSON inputs, stem otherwise) must
+            # be computed BEFORE process_one — the claim step moves the file
+            # out of INPUT_DIR, after which this path can no longer be read.
+            prefix = report_prefix(source)
+
+            # Wipe intermediate before this file's staging so it only holds
+            # this file's artifacts.
             primary.wipe_output()
-            if not primary.process_one(xlsx):
+            if not primary.process_one(source):
                 rc_primary = 1
                 continue
 
-            # TIA report for this single file. Include the source stem in the
-            # output filename so per-file reports don't collide.
-            safe_stem = ExcelToJsonConverter.safe_name(xlsx.stem)
             try:
-                out_path = tia.generate(
-                    intermediate_dir,
-                    filename_prefix=f"TIA_{safe_stem}",
-                )
-                logger.info("TIA report for %s: %s", xlsx.name, out_path)
-            except (
-                TiaGenerationError,
-                FileNotFoundError,
-                requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout,
-            ) as exc:
-                logger.error("TIA failed for %s: %s", xlsx.name, exc)
+                out_path = tia.generate(intermediate_dir, filename_prefix=prefix)
+                logger.info("TIA report for %s: %s", source.name, out_path)
+            except (TiaGenerationError, FileNotFoundError, *TRANSIENT_ERRORS) as exc:
+                logger.error("TIA failed for %s: %s", source.name, exc)
                 rc_tia = 1
-                # Keep the source xlsx in PROCESSING_DIR so the operator can
+                # Keep the source file in PROCESSING_DIR so the operator can
                 # retry on the next scheduled run, instead of graduating it
                 # to PROCESSED_DIR with no corresponding TIA report.
-                primary.unmark_processed(xlsx.name)
+                primary.unmark_processed(source.name)
                 logger.info(
                     "left %s in PROCESSING_DIR for retry (TIA failed)",
-                    xlsx.name,
+                    source.name,
                 )
 
     # End-of-run finalize: move successfully-converted primary source files

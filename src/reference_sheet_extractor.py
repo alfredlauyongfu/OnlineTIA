@@ -7,8 +7,8 @@ intra-sheet duplicates. Each non-empty extraction is written as
 `extracted_{sheet}_{YYYYMMDD_HHMMSS}.json` back into the same
 reference_json_dir. Source files and extraction files coexist in that dir
 and are distinguished by the `extracted_` prefix; only `extracted_*.json`
-files are wiped at the start of each `combine()` call (the source per-sheet
-JSONs the converter just wrote are preserved).
+files are wiped at the start of each `extract_sheets()` call (the source
+per-sheet JSONs the converter just wrote are preserved).
 
 (The previous pass-2 LLM merge into a single consolidated JSON has been
 removed — downstream consumers now use the RAG service to query the
@@ -28,6 +28,16 @@ from pathlib import Path
 from typing import Any
 
 import requests
+
+from excel_to_json import ExcelToJsonConverter
+from http_resilient import (
+    CONNECT_TIMEOUT,
+    READ_TIMEOUT,
+    TRANSIENT_ERRORS,
+    call_resilient,
+    parse_json,
+    raise_for_status,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -57,12 +67,19 @@ topic (object, list of objects, etc.). Omit any key whose value would be empty.
 
 If the sheet contributes nothing useful, output exactly: {}
 
-Keep the JSON COMPACT — large sheets otherwise overflow the response limit:
+For every question/rated item, ALWAYS include a "question" field holding the
+sheet's full question text VERBATIM (the exact wording the customer was asked,
+e.g. "Are the connections between the Application Server(s) and the Database
+secured?") — this is required so downstream reports can show the complete
+question. Use a short snake_case key for the item AND keep this full "question"
+value; that is the one place full wording is retained.
+
+Keep the rest of the JSON COMPACT — large sheets otherwise overflow the response limit:
 - Do NOT copy long guidance / help / explanatory paragraphs verbatim. Where a
   scoring table gives per-option guidance, condense it to at most one short
   phrase, or omit it and keep just the option label and its score/rating.
-- Do not repeat a question's full wording as both a key and a value; use a
-  short snake_case key and keep the value to the essential fact.
+- Apart from the required "question" field, do not repeat wording; keep every
+  other value to the essential fact.
 - For scoring/rating tables, prefer capturing the recommended/best value and
   the key thresholds compactly rather than enumerating every option in full.
 - Avoid duplicated boilerplate across entries; state shared context once.
@@ -74,7 +91,7 @@ Output requirements:
 """
 
 
-class ReferenceJsonCombiner:
+class ReferenceSheetExtractor:
     # Per-call output cap. The gateway's default max_tokens truncates response
     # JSON around ~4K tokens; 16384 was insufficient for the largest sheet
     # (SQL_Server), whose verbose scoring JSON overflowed and produced an
@@ -90,7 +107,7 @@ class ReferenceJsonCombiner:
         use_case_id: str,
         model: str,
         reference_json_dir: Path,
-        timeout_seconds: float = 600.0,
+        timeout_seconds: float = READ_TIMEOUT,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.api_key = api_key
@@ -102,7 +119,7 @@ class ReferenceJsonCombiner:
 
     # ---- public ----
 
-    def combine(self) -> int:
+    def extract_sheets(self) -> int:
         if not self.reference_json_dir.is_dir():
             logger.error("Reference JSON directory not found: %s", self.reference_json_dir)
             return 1
@@ -129,7 +146,7 @@ class ReferenceJsonCombiner:
             "wiped %d previous extracted_*.json file(s) from %s",
             wiped, self.reference_json_dir,
         )
-        logger.info("combine() starting: %d source file(s)", len(json_files))
+        logger.info("extract_sheets() starting: %d source file(s)", len(json_files))
 
         non_empty = 0
         for jf in json_files:
@@ -168,7 +185,7 @@ class ReferenceJsonCombiner:
                 logger.info("extracted %s -> (no relevant content)", jf.name)
 
         logger.info(
-            "combine() finished: %d non-empty extraction(s) written to %s",
+            "extract_sheets() finished: %d non-empty extraction(s) written to %s",
             non_empty, self.reference_json_dir,
         )
         return 0
@@ -177,12 +194,9 @@ class ReferenceJsonCombiner:
 
     @staticmethod
     def _sheet_name_from_filename(path: Path) -> str:
-        """Filenames produced by ExcelToJsonConverter look like
-        '{workbook_stem}__{sheet_name}.json'. Take the part after '__'.
-        Fall back to the full stem if the separator isn't present.
-        """
-        stem = path.stem
-        return stem.split("__", 1)[1] if "__" in stem else stem
+        """Delegates to the converter, which owns the
+        '{workbook_stem}__{sheet_name}.json' naming convention."""
+        return ExcelToJsonConverter.sheet_name_from_path(path)
 
     def _extract_sheet(self, sheet_name: str, sheet_data: Any) -> dict[str, Any]:
         user_content = json.dumps(
@@ -232,24 +246,25 @@ class ReferenceJsonCombiner:
 
         try:
             try:
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    json=body,
-                    timeout=self.timeout_seconds,
+                response = call_resilient(
+                    lambda: requests.post(
+                        url,
+                        headers=headers,
+                        json=body,
+                        timeout=(CONNECT_TIMEOUT, self.timeout_seconds),
+                    ),
+                    label=f"extract LLM [{label}]",
+                    read_timeout=self.timeout_seconds,
                 )
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            except TRANSIENT_ERRORS as exc:
                 raise GatewayUnreachable(f"Cannot reach gateway at {url}: {exc}") from exc
 
-            if not response.ok:
-                # On error the body is a short HTML/JSON page, safe to read fully.
-                raise RuntimeError(
-                    f"LLM HTTP {response.status_code}: {response.text[:500]}"
-                )
+            raise_for_status(response, label="LLM", error_cls=RuntimeError)
+            payload = parse_json(response, label="LLM", error_cls=RuntimeError)
 
             try:
-                content = response.json()["choices"][0]["message"]["content"]
-            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                content = payload["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError) as exc:
                 raise RuntimeError(
                     f"Unexpected LLM response shape: {exc}; body={response.text[:500]}"
                 )

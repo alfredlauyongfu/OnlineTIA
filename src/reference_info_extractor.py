@@ -16,8 +16,8 @@
 Downstream consumers push the extracted files into the RAG service via
 `rag_ingester.RagIngester` (out of scope for this module).
 
-Can be run directly (python src\reference_info_extractor.py) for
-isolated testing, or imported by run.py.
+`extract()` is imported and driven by run.py, whose bootstrap has already
+validated the env vars this stage reads and configured logging.
 """
 
 from __future__ import annotations
@@ -27,31 +27,13 @@ import os
 from pathlib import Path
 
 from excel_to_json import ExcelToJsonConverter
-from logging_setup import bootstrap
-from reference_json_combiner import ReferenceJsonCombiner
-
-
-REQUIRED_ENV_VARS = (
-    "SSC_CLOUD_AIGATEWAY_BASE_URL",
-    "SSC_CLOUD_AIGATEWAY_API_KEY",
-    "SSC_CLOUD_AIGATEWAY_USER_ID",
-    "SSC_CLOUD_AIGATEWAY_MODEL",
-    "USE_CASE_ID",
-    "REFERENCE_TO_BE_LOADED_DIR",
-    "REFERENCE_LOADED_DIR",
-    "REFERENCE_JSON_DIR",
-    "LOG_DIR",
-)
+from reference_sheet_extractor import ReferenceSheetExtractor
 
 
 logger = logging.getLogger(__name__)
 
 
 def extract() -> int:
-    rc = bootstrap(REQUIRED_ENV_VARS)
-    if rc is not None:
-        return rc
-
     reference_json_dir = Path(os.environ["REFERENCE_JSON_DIR"])
     to_be_loaded_dir = Path(os.environ["REFERENCE_TO_BE_LOADED_DIR"])
     loaded_dir = Path(os.environ["REFERENCE_LOADED_DIR"])
@@ -59,10 +41,7 @@ def extract() -> int:
     # Inbox guard: if nothing waiting, skip both stages — leave the JSON and
     # extracted dirs untouched so the downstream RAG sync gate sees no
     # changes and stays idempotent.
-    incoming = sorted(
-        p for p in to_be_loaded_dir.glob("*.xls[xm]")
-        if not p.name.startswith("~$")
-    )
+    incoming = ExcelToJsonConverter.list_workbooks(to_be_loaded_dir)
     if not incoming:
         logger.info(
             "No xlsx in %s; skipping convert and extract stages "
@@ -89,7 +68,7 @@ def extract() -> int:
     rc_convert = converter.convert_folder()
 
     # Stage 2: LLM extraction.
-    combiner = ReferenceJsonCombiner(
+    extractor = ReferenceSheetExtractor(
         api_url=os.environ["SSC_CLOUD_AIGATEWAY_BASE_URL"],
         api_key=os.environ["SSC_CLOUD_AIGATEWAY_API_KEY"],
         user_id=os.environ["SSC_CLOUD_AIGATEWAY_USER_ID"],
@@ -101,20 +80,15 @@ def extract() -> int:
     logger.info("-- stage: extract reference json --")
     # Config summary stays as plain prints — it's per-run operator context,
     # not part of the persistent operational trail.
-    print(f"  reference dir: {combiner.reference_json_dir}")
-    print(f"  model        : {combiner.model}")
-    print(f"  endpoint     : {combiner.api_url}/v1/chat/completions")
+    print(f"  reference dir: {extractor.reference_json_dir}")
+    print(f"  model        : {extractor.model}")
+    print(f"  endpoint     : {extractor.api_url}/v1/chat/completions")
 
-    rc_combine = combiner.combine()
-    logger.info("extract stage finished (rc=%d)", rc_combine)
+    rc_extract = extractor.extract_sheets()
+    logger.info("extract stage finished (rc=%d)", rc_extract)
 
     # Finalize: move successfully-converted xlsx from inbox to loaded.
     moved = converter.finalize_to_processed_dir()
     logger.info("moved %d xlsx to %s", moved, loaded_dir)
 
-    return rc_convert or rc_combine
-
-
-if __name__ == "__main__":
-    print("=== reference_info_extractor (standalone) ===")
-    raise SystemExit(extract())
+    return rc_convert or rc_extract

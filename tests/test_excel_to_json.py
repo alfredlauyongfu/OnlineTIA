@@ -38,13 +38,7 @@ def test_safe_name(raw: str, expected: str) -> None:
     assert ExcelToJsonConverter.safe_name(raw) == expected
 
 
-# ---------- _cell_value (date serialization) ----------
-
-class _FakeCell:
-    """Stand-in for openpyxl's Cell, exposing only `.value`."""
-    def __init__(self, value):
-        self.value = value
-
+# ---------- _json_value (date serialization) ----------
 
 @pytest.mark.parametrize(
     "value, expected",
@@ -59,8 +53,8 @@ class _FakeCell:
         (dt.time(9, 0, 0), "09:00:00"),
     ],
 )
-def test_cell_value_serialization(value, expected) -> None:
-    assert ExcelToJsonConverter._cell_value(_FakeCell(value)) == expected
+def test_json_value_serialization(value, expected) -> None:
+    assert ExcelToJsonConverter._json_value(value) == expected
 
 
 # ---------- in-memory workbook helper ----------
@@ -351,3 +345,82 @@ def test_json_output_is_valid_json(tmp_path: Path) -> None:
         {"name": "widget", "qty": 5},
         {"name": "gadget", "qty": 12},
     ]
+
+
+# ---------- JSON form-export inputs ----------
+
+def _make_lifecycle_converter(tmp_path: Path) -> tuple[ExcelToJsonConverter, Path, Path, Path]:
+    """Converter in move-mode with fresh inbox/processing/processed/out dirs.
+    Returns (converter, inbox, processing, out)."""
+    inbox = tmp_path / "inbox"
+    proc = tmp_path / "processing"
+    out = tmp_path / "out"
+    inbox.mkdir()
+    conv = ExcelToJsonConverter(
+        input_dir=inbox, output_dir=out,
+        processing_dir=proc, processed_dir=tmp_path / "processed",
+    )
+    return conv, inbox, proc, out
+
+
+def test_list_customer_inputs_covers_both_formats(tmp_path: Path) -> None:
+    """Excel AND JSON inputs are listed (sorted); Office lock files are not."""
+    (tmp_path / "b.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "a.xlsx").write_bytes(b"x")
+    (tmp_path / "c.xlsm").write_bytes(b"x")
+    (tmp_path / "~$a.xlsx").write_bytes(b"x")
+    (tmp_path / "notes.txt").write_text("ignored")
+    names = [p.name for p in ExcelToJsonConverter.list_customer_inputs(tmp_path)]
+    assert names == ["a.xlsx", "b.json", "c.xlsm"]
+
+
+def test_process_one_stages_valid_json(tmp_path: Path) -> None:
+    """A JSON form export is claimed, validated, re-serialized into
+    output_dir, and recorded for finalize — same lifecycle as a workbook."""
+    conv, inbox, proc, out = _make_lifecycle_converter(tmp_path)
+    src = inbox / "TIA_id1 20260704.json"
+    src.write_text(json.dumps({"Booking ID": "id1", "Q": "A"}), encoding="utf-8")
+
+    assert conv.process_one(src) is True
+    assert not src.exists()                                  # claimed
+    assert (proc / src.name).exists()
+    assert conv.successfully_processed_paths == [proc / src.name]
+    staged = json.loads((out / src.name).read_text(encoding="utf-8"))
+    assert staged == {"Booking ID": "id1", "Q": "A"}
+
+
+def test_process_one_stages_bom_json_as_plain_utf8(tmp_path: Path) -> None:
+    """A UTF-8-BOM form export (common from web exports) stages successfully,
+    and the staged copy parses with PLAIN utf-8 — the contract the TIA
+    generator's reader relies on."""
+    conv, inbox, _, out = _make_lifecycle_converter(tmp_path)
+    src = inbox / "resp.json"
+    src.write_bytes(b"\xef\xbb\xbf" + json.dumps({"Q": "Ä"}).encode("utf-8"))
+
+    assert conv.process_one(src) is True
+    with (out / "resp.json").open("r", encoding="utf-8") as f:  # no -sig
+        assert json.load(f) == {"Q": "Ä"}
+
+
+def test_process_one_rejects_unparseable_json(tmp_path: Path) -> None:
+    """A file that doesn't parse stays in PROCESSING (like a bad workbook):
+    False returned, not tracked, nothing staged."""
+    conv, inbox, proc, out = _make_lifecycle_converter(tmp_path)
+    src = inbox / "bad.json"
+    src.write_text("not json {", encoding="utf-8")
+
+    assert conv.process_one(src) is False
+    assert (proc / "bad.json").exists()                      # left for inspection
+    assert conv.successfully_processed_paths == []
+    assert not (out / "bad.json").exists()
+
+
+def test_process_one_rejects_non_object_json(tmp_path: Path) -> None:
+    """Parses, but isn't a JSON object → rejected the same way."""
+    conv, inbox, proc, out = _make_lifecycle_converter(tmp_path)
+    src = inbox / "list.json"
+    src.write_text("[1, 2, 3]", encoding="utf-8")
+
+    assert conv.process_one(src) is False
+    assert (proc / "list.json").exists()
+    assert not (out / "list.json").exists()
