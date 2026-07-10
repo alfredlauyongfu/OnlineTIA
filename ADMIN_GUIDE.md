@@ -11,10 +11,10 @@ list, see [README.md](README.md). This guide is the day-to-day operational compa
 
 ```mermaid
 flowchart LR
-    C["Customer<br/>fills Microsoft Form"] --> F["Microsoft Forms<br/>(auto-sends confirmation email)"]
-    F --> PA["Power Automate<br/>writes response as JSON"]
-    PA --> SP[("SharePoint library<br/>synced to the agent machine")]
-    SP --> IN["InputCustomerResponse<br/>(local, synced)"]
+    C["Customer<br/>fills Microsoft Form"] --> F["Microsoft Forms"]
+    F --> PA["Power Automate<br/>sends confirmation email +<br/>writes response as JSON"]
+    PA --> SP[("SharePoint library")]
+    SP -->|OneDrive sync| IN["InputCustomerResponse<br/>(agent working folder)"]
     IN --> AG["Agent (run.py)<br/>hourly — generates report"]
     AG --> OUT["OutputReport<br/>.md + .docx"]
     OUT --> CON["Blue Prism consultant<br/>reviews / edits the .docx"]
@@ -23,15 +23,16 @@ flowchart LR
 
 The agent's responsibility is the middle of this chain only: it starts when a JSON lands
 in `InputCustomerResponse` and ends when a report is written to `OutputReport`. The
-confirmation email, the JSON export, and sending the finished report are all handled
-outside the agent (Microsoft Forms, Power Automate, and the consultant respectively).
+confirmation email and the JSON export are handled by Power Automate (the form itself is
+Microsoft Forms), and sending the finished report is the consultant's manual step — all
+outside the agent.
 
 ## Customer's point of view
 
 1. Go to **https://forms.office.com/r/J9yBcDpfy9** and fill in the form.
 2. Within seconds of submitting, receive a **confirmation email** containing a summary of
-   the questions and answers. *(This email is sent by Microsoft Forms, not by the agent.)*
-3. Receive the **TIA report from a Blue Prism consultant within a week**.
+   the questions and answers. *(This email is sent by Power Automate, not by the agent.)*
+3. Receive the **Online TIA report from a Blue Prism consultant within a week**.
 
 ## Admin's point of view
 
@@ -41,20 +42,24 @@ All input and output data lives in a SharePoint document library:
 
 > https://ssctechnologiesinc.sharepoint.com/teams/BPM-ProfessionalServices/Shared%20Documents/Forms/Document%20Names.aspx?id=%2Fteams%2FBPM%2DProfessionalServices%2FShared%20Documents%2FTeam%20Documents%2FPortfolio%2FOnlineTIA%2FAutomation&sortField=Modified&isAscending=false&viewid=e305230c%2D633b%2D44e9%2Db07f%2Dfff94774adaa
 
-That library is **synced to the agent machine** at `C:\blueprism\OnlineTIAWorkingDir`, so
-anything appearing on SharePoint appears in the corresponding local folder (and vice
-versa). The agent reads and writes these local folders.
+That library is synchronised to the agent machine through **OneDrive**, where it appears as
+the local folder tree under `C:\blueprism\OnlineTIAWorkingDir` that the agent reads and
+writes. So a JSON that Power Automate saves into the library appears in the local
+`InputCustomerResponse` folder for the agent to pick up, and reports the agent writes
+locally sync back up to the library.
 
 ### How submissions arrive
 
-A **Power Automate** flow turns each form submission into a JSON file and writes it to the
-SharePoint library, which syncs it into **`InputCustomerResponse`** — one JSON file per
-customer response. No manual step is needed for normal intake.
+A **Power Automate** flow turns each form submission into a JSON file that arrives in
+**`InputCustomerResponse`** — one JSON file per customer response. No manual step is needed
+for normal intake.
 
 ### The agent and its schedule
 
-The agent (`run.py`) runs **hourly** via Windows Task Scheduler. Each run processes every
-pending file it finds. When the inbox is empty, the run is a fast no-op.
+The agent (`run.py`) is scheduled via Windows Task Scheduler to run **once every hour, 12
+times a day — from 2:00 AM to 2:00 PM US Eastern (GMT−5), 7 days a week**. Each run
+processes every pending file it finds; when the inbox is empty, the run is a fast no-op.
+Submissions that arrive outside that window are picked up on the next scheduled run.
 
 ### Customer-file lifecycle
 
@@ -163,6 +168,7 @@ For the full list see the README's *Troubleshooting* section. The common operati
   sent to the SS&C Cloud AI Gateway for processing.
 - **Prerequisites** — the agent machine needs a filled-in `.env` and network/VPN access to
   the SS&C Cloud AI Gateway. See the README's *Deployment* and *Troubleshooting* sections.
-- **Boundaries** — the confirmation email and the JSON export belong to Microsoft Forms /
-  Power Automate; sending the finished report is the consultant's manual step. The agent
-  owns only the stretch from `InputCustomerResponse` to `OutputReport`.
+- **Boundaries** — the confirmation email and the JSON export belong to Power Automate
+  (the form itself is Microsoft Forms); sending the finished report is the consultant's
+  manual step. The agent owns only the stretch from `InputCustomerResponse` to
+  `OutputReport`.
