@@ -375,10 +375,14 @@ workbook**. The next `run.py` will, **for each input file**:
    `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md` (~5 RAG calls total: analysis,
    verification, and the three narrative sections). A
    **Microsoft Word copy** (`.docx`) is then written alongside it from the
-   same content — independently and best-effort: it is built natively
-   (headings, tables, lists), not converted from the `.md` file, and if
-   Word generation fails the `.md` is unaffected and the run still
-   succeeds.
+   same content — independently and best-effort. It is rendered into the
+   SS&C / Blue Prism house-style template (`assets/tia_template.docx`:
+   branded cover page, logo running-header, "Commercial in Confidence" +
+   page-number footer, Arial Nova theme and Heading styles), with the
+   customer's Organisation on the cover; the body maps natively (Heading 1/2,
+   tables, lists) — not converted from the `.md` file. If the template is
+   missing it falls back to a blank document, and if Word generation fails the
+   `.md` is unaffected and the run still succeeds.
 
    > **Why section by section?** Generating each section as its own call
    > scopes the RAG retrieval to that section's topic and keeps each
@@ -466,7 +470,7 @@ From the project root, using the venv-Python:
 & .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected output ends with `183 passed` (in a few seconds) and exit code 0. If you
+Expected output ends with `184 passed` (in a few seconds) and exit code 0. If you
 see a failure, the line immediately above the summary identifies the
 file and test name.
 

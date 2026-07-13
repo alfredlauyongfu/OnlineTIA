@@ -308,6 +308,9 @@ class TiaReportGenerator:
         # Customer form keys for the current generate() call — used by the
         # missing-subject guardrail. Set at the top of generate().
         self._customer_keys: list[str] = []
+        # Cover metadata for the branded .docx — set at the top of generate().
+        self._cover_org: str = "Customer"
+        self._cover_date: str = ""
 
     # ---- public ----
 
@@ -328,6 +331,7 @@ class TiaReportGenerator:
         self._customer_keys = [
             k for v in customer_content.values() if isinstance(v, dict) for k in v
         ]
+        self._cover_org, self._cover_date = self._extract_cover_meta(customer_content)
 
         logger.info(
             "TIA generate start: source_dir=%s, files=%d, model=%s, tags=%s, sections=%d",
@@ -607,7 +611,10 @@ class TiaReportGenerator:
         try:
             from docx_writer import write_docx
 
-            write_docx(self.REPORT_TITLE, section_texts, docx_path)
+            write_docx(
+                section_texts, docx_path,
+                organisation=self._cover_org, assessment_date=self._cover_date,
+            )
             logger.info(
                 "TIA %sWord written: %s (%d bytes)",
                 tag, docx_path, docx_path.stat().st_size,
@@ -619,6 +626,29 @@ class TiaReportGenerator:
         return out_path
 
     # ---- internals ----
+
+    @staticmethod
+    def _extract_cover_meta(customer_content: dict[str, Any]) -> tuple[str, str]:
+        """Pull the Organisation and assessment date for the .docx cover from the
+        customer form data. Falls back to 'Customer' / today's date when absent."""
+        org: str | None = None
+        date: str | None = None
+        for v in customer_content.values():
+            if not isinstance(v, dict):
+                continue
+            org = org or (v.get("Organisation") or None)
+            if date is None and v.get("Submission time"):
+                raw = str(v["Submission time"])
+                try:
+                    date = dt.datetime.fromisoformat(
+                        raw.replace("Z", "+00:00")
+                    ).strftime("%d %B %Y")
+                except ValueError:
+                    date = raw
+        return (
+            (org.strip() if isinstance(org, str) and org.strip() else "Customer"),
+            date or dt.datetime.now().strftime("%d %B %Y"),
+        )
 
     def _load_reference_guidance(self) -> str | None:
         """Concatenate the extracted reference JSONs (the per-answer criticality
