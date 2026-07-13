@@ -8,13 +8,15 @@ pytest's tmp_path filesystem.
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 from pathlib import Path
 
 import pytest
 from openpyxl import Workbook
 
-from excel_to_json import ExcelToJsonConverter
+import excel_to_json
+from excel_to_json import ExcelToJsonConverter, read_json_object
 
 
 # ---------- safe_name ----------
@@ -424,3 +426,73 @@ def test_process_one_rejects_non_object_json(tmp_path: Path) -> None:
     assert conv.process_one(src) is False
     assert (proc / "list.json").exists()
     assert not (out / "list.json").exists()
+
+
+# ---------- read_json_object: OneDrive placeholder / retry robustness ----------
+
+class _FakePath:
+    """Minimal Path stand-in for read_json_object: it only calls .open(),
+    .stat() and .name. `open_results` is consumed one entry per open() call —
+    an Exception instance is raised, anything else is returned as the handle.
+    `stat_attrs` (or None) is exposed as st_file_attributes on stat()."""
+
+    def __init__(self, name="resp.json", open_results=(), stat_attrs=None):
+        self.name = name
+        self._open_results = list(open_results)
+        self._stat_attrs = stat_attrs
+
+    def open(self, *args, **kwargs):
+        result = self._open_results.pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def stat(self):
+        st = type("_St", (), {})()
+        if self._stat_attrs is not None:
+            st.st_file_attributes = self._stat_attrs
+        return st
+
+
+def test_read_json_object_reads_valid_object(tmp_path: Path) -> None:
+    src = tmp_path / "ok.json"
+    src.write_text(json.dumps({"a": 1}), encoding="utf-8")
+    assert read_json_object(src) == {"a": 1}
+
+
+def test_read_json_object_rejects_non_object() -> None:
+    p = _FakePath(open_results=[io.StringIO("[1, 2, 3]")])
+    with pytest.raises(ValueError):
+        read_json_object(p)  # type: ignore[arg-type]
+
+
+def test_read_json_object_placeholder_raises_actionable_hint() -> None:
+    """A read that fails on an online-only placeholder is turned into an
+    actionable OSError instead of the opaque [Errno 22], with no retry."""
+    err = OSError(22, "Invalid argument")
+    p = _FakePath(open_results=[err], stat_attrs=0x1000)  # FILE_ATTRIBUTE_OFFLINE
+    with pytest.raises(OSError) as ei:
+        read_json_object(p)  # type: ignore[arg-type]
+    msg = str(ei.value)
+    assert "online-only placeholder" in msg
+    assert "Always keep on this device" in msg
+
+
+def test_read_json_object_retries_transient_then_succeeds(monkeypatch) -> None:
+    """A transient (non-placeholder) OSError is retried and then succeeds."""
+    monkeypatch.setattr(excel_to_json, "_READ_RETRY_DELAY", 0)
+    p = _FakePath(
+        open_results=[OSError(22, "Invalid argument"), io.StringIO('{"ok": true}')],
+        stat_attrs=None,  # not a placeholder → eligible for retry
+    )
+    assert read_json_object(p) == {"ok": True}  # type: ignore[arg-type]
+
+
+def test_read_json_object_reraises_after_exhausting_retries(monkeypatch) -> None:
+    monkeypatch.setattr(excel_to_json, "_READ_RETRY_DELAY", 0)
+    p = _FakePath(
+        open_results=[OSError(22, "x")] * excel_to_json._READ_RETRIES,
+        stat_attrs=None,
+    )
+    with pytest.raises(OSError):
+        read_json_object(p)  # type: ignore[arg-type]

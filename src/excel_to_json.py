@@ -24,6 +24,8 @@ import json
 import logging
 import re
 import shutil
+import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -47,6 +49,79 @@ def move_replacing(src: Path, dst: Path) -> None:
     if dst.exists():
         dst.unlink()
     shutil.move(str(src), str(dst))
+
+
+# --- OneDrive / Files On-Demand robustness --------------------------------
+# A customer input synced via OneDrive can arrive as an "online-only"
+# placeholder: its metadata is on disk (so claiming it into processing_dir is a
+# fast rename that succeeds) but its bytes are not. The first content read then
+# triggers a hydration/recall that fails with OSError [Errno 22] Invalid
+# argument when no OneDrive client is available to service it — e.g. under the
+# non-interactive service account that runs the scheduled pipeline. These
+# Windows attributes mark such a placeholder; os.stat() reads them WITHOUT
+# itself triggering a recall (so the check is safe and cheap). The attributes
+# are absent on non-Windows, where the bitmask is harmless and the check is
+# always False.
+_PLACEHOLDER_ATTRS = (
+    getattr(stat, "FILE_ATTRIBUTE_OFFLINE", 0x1000)
+    | getattr(stat, "FILE_ATTRIBUTE_RECALL_ON_OPEN", 0x40000)
+    | getattr(stat, "FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS", 0x400000)
+)
+_PLACEHOLDER_HINT = (
+    "{err}: '{path}' is a OneDrive online-only placeholder — its content is not "
+    "downloaded locally, so it cannot be read. In OneDrive, right-click the "
+    "input folder and choose 'Always keep on this device' (or disable Files "
+    "On-Demand), and make sure the OneDrive client is running and signed in for "
+    "the account that runs this pipeline."
+)
+# A read is retried a few times to ride out a file OneDrive is still syncing
+# down (transient lock / partial write); a detected placeholder fails fast with
+# the actionable hint above, because retrying can never hydrate it.
+_READ_RETRIES = 3
+_READ_RETRY_DELAY = 2.0
+
+
+def _is_cloud_placeholder(path: Path) -> bool:
+    """True if `path` is a OneDrive / Files On-Demand online-only placeholder
+    (Windows only; always False elsewhere). Reads metadata only — never
+    triggers a recall."""
+    try:
+        attrs = getattr(path.stat(), "st_file_attributes", 0)
+    except OSError:
+        return False
+    return bool(attrs & _PLACEHOLDER_ATTRS)
+
+
+def read_json_object(path: Path) -> dict[str, Any]:
+    """Read and JSON-parse `path` (tolerating a UTF-8 BOM) and return the
+    object.
+
+    Retries on OSError to ride out a file OneDrive is still syncing down. A
+    detected online-only placeholder raises an actionable OSError immediately
+    (instead of the opaque [Errno 22]) since retrying cannot help it. Raises
+    ValueError if the payload is valid JSON but not an object.
+    """
+    for attempt in range(_READ_RETRIES):
+        try:
+            with path.open("r", encoding="utf-8-sig") as f:
+                payload = json.load(f)
+        except OSError as exc:
+            if _is_cloud_placeholder(path):
+                raise OSError(
+                    _PLACEHOLDER_HINT.format(err=exc.strerror or exc, path=path)
+                ) from exc
+            if attempt + 1 >= _READ_RETRIES:
+                raise
+            logger.warning(
+                "read of %s failed (%s); retry %d/%d in %.0fs",
+                path.name, exc, attempt + 1, _READ_RETRIES - 1, _READ_RETRY_DELAY,
+            )
+            time.sleep(_READ_RETRY_DELAY)
+            continue
+        if not isinstance(payload, dict):
+            raise ValueError(f"expected a JSON object, got {type(payload).__name__}")
+        return payload
+    raise AssertionError("unreachable: loop returns or raises on every path")
 
 
 class ExcelToJsonConverter:
@@ -160,12 +235,7 @@ class ExcelToJsonConverter:
         validated, which is what the TIA generator's reader expects.
         Returns the written filename, or None on failure."""
         try:
-            with source.open("r", encoding="utf-8-sig") as f:
-                payload = json.load(f)
-            if not isinstance(payload, dict):
-                raise ValueError(
-                    f"expected a JSON object, got {type(payload).__name__}"
-                )
+            payload = read_json_object(source)
         except Exception as exc:
             suffix = f" (left in {source})" if self._moves_sources else ""
             logger.error("FAILED %s: %s%s", source.name, exc, suffix)

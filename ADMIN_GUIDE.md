@@ -48,6 +48,15 @@ writes. So a JSON that Power Automate saves into the library appears in the loca
 `InputCustomerResponse` folder for the agent to pick up, and reports the agent writes
 locally sync back up to the library.
 
+> **Required one-time setup — keep the folder available offline.** OneDrive's *Files
+> On-Demand* can leave synced files as "online-only" placeholders whose content isn't
+> actually on disk. The agent runs under a service account with no interactive OneDrive
+> session, so it cannot download a placeholder on demand and the run fails with
+> `[Errno 22] Invalid argument`. **In File Explorer, right-click the OneDrive
+> `Online TIA` folder → "Always keep on this device"** so every synced file is fully
+> downloaded before the agent reads it. Confirm the folder shows the green ✓ ("available
+> on this device"), not the cloud icon.
+
 ### How submissions arrive
 
 A **Power Automate** flow turns each form submission into a JSON file that arrives in
@@ -151,6 +160,7 @@ For the full list see the README's *Troubleshooting* section. The common operati
 | Symptom | Cause & action |
 |---------|----------------|
 | File stuck in `Processing` after a run | A stage failed for that file (often the gateway was unreachable). It is retried automatically next hour. If it persists, check VPN / gateway reachability / the API key, and read `Logs\logs.txt`. |
+| Log shows `[Errno 22] Invalid argument` reading an input, or `online-only placeholder` | The input is a OneDrive placeholder that isn't downloaded locally. Right-click the `Online TIA` folder → **"Always keep on this device"** (see *Where the data lives*), and confirm the OneDrive client is running and signed in. Re-run manually once fixed. |
 | Report contains an `INCOMPLETE REPORT` banner | A section failed part-way through generation. The source file is kept so the next run regenerates the full report. |
 | No report for a submission | Search `Logs\logs.txt` for that Booking ID. Usual causes: the gateway was down, or the JSON was malformed. |
 | A reference-file update didn't take effect | Confirm the file is in `ReferenceToBeLoaded`; check the log's RAG-sync / passthrough lines; after a successful run it should have graduated to `ReferenceLoaded`. |

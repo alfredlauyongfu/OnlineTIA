@@ -470,7 +470,7 @@ From the project root, using the venv-Python:
 & .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected output ends with `184 passed` (in a few seconds) and exit code 0. If you
+Expected output ends with `189 passed` (in a few seconds) and exit code 0. If you
 see a failure, the line immediately above the summary identifies the
 file and test name.
 
@@ -576,6 +576,16 @@ machine without VPN or gateway access.
 - **`--- stage: generate TIA report (skipped: no files in INPUT_DIR) ---`**
   — expected when no customer workbooks are present. Drop one into
   `INPUT_DIR` to trigger the per-file primary + TIA loop.
+- **`FAILED <name>: [Errno 22] Invalid argument`** or
+  **`... is a OneDrive online-only placeholder`** — the input file is a
+  OneDrive *Files On-Demand* placeholder whose content isn't downloaded
+  locally, so reading it fails (common when the working dirs are
+  OneDrive-synced and the pipeline runs under a service account with no
+  interactive OneDrive session). In File Explorer, right-click the synced
+  folder → **"Always keep on this device"**, and confirm the OneDrive
+  client is running and signed in for that account. The staging read
+  retries a few times to ride out an in-progress sync, but a true
+  placeholder is reported immediately (it cannot be hydrated from code).
 - **RAG sync re-uploads on every reference run** — every reference
   extract pass produces fresh timestamped `extracted_*.json` filenames,
   so the sync gate's set-difference sees old extractions as stale and
