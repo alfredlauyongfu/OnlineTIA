@@ -5,22 +5,23 @@ A Python pipeline that turns Blue Prism **Technical Infrastructure Assessment
 RAG knowledge base populated from two kinds of reference materials —
 **TIA reference workbooks** (Excel, sheet-by-sheet LLM-distilled before
 upload) and **passthrough documents** (PDFs and similar, uploaded directly
-without conversion) — then, for each customer response workbook, runs a
-RAG-grounded LLM call that combines the customer's data with the most
-relevant reference chunks and writes the resulting TIA report to disk.
+without conversion) — then, for each customer response (JSON form export
+or Excel workbook), runs a RAG-grounded generation that combines the
+customer's data with the most relevant reference chunks and writes the
+resulting TIA report to disk.
 
 ## Architecture / data flow
 
 ### At a glance
 
 The whole system in one picture: reference materials build a searchable
-knowledge base; a customer's Excel response is assessed against it; out
+knowledge base; a customer's response is assessed against it; out
 comes a report in Markdown **and** Word.
 
 ```mermaid
 flowchart LR
     REF["Reference materials<br/>(TIA workbooks + PDFs)"] --> KB[("RAG knowledge base")]
-    CUST["Customer response<br/>(Excel workbook)"] --> ENGINE["TIA engine<br/>(RAG-grounded LLM)"]
+    CUST["Customer response<br/>(JSON form export or Excel workbook)"] --> ENGINE["TIA engine<br/>(RAG-grounded LLM)"]
     KB -. grounds .-> ENGINE
     ENGINE --> OUT["TIA report<br/>Markdown + Word"]
 ```
@@ -49,7 +50,7 @@ flowchart TD
         direction TB
         IN["INPUT_DIR<br/>customer *.json / *.xlsx / *.xlsm"]
         IN -->|"one file at a time"| S3["Stage 3 — stage as JSON<br/>(wipe INTERMEDIATE first)"]
-        S3 --> S4["Stage 4 — generate TIA<br/>canonical analysis → verification → 8 sections"]
+        S3 --> S4["Stage 4 — generate TIA<br/>canonical analysis → verification → 4 sections"]
         S4 -->|"TIA_&lt;stem&gt;_&lt;ts&gt;"| OUT["OUTPUT_REPORT_DIR<br/>.md + .docx"]
         S3 -.->|"INPUT → PROCESSING → PROCESSED<br/>(only if TIA succeeded)"| PROC["PROCESSED_DIR"]
     end
@@ -111,6 +112,7 @@ only Python file at the project root.
 | `src/reference_sheet_extractor.py` | `ReferenceSheetExtractor` — per-sheet LLM extraction via `/v1/chat/completions`. |
 | `src/rag_ingester.py` | `RagIngester` — list/register/upload/delete against `/rag/ingest/*`, with basename-equality sync gate (now supports `extra_files` for cross-dir local sets). |
 | `src/tia_generator.py` | `TiaReportGenerator` — generates the Markdown TIA via `/rag/chat/completions`, **one section at a time** (scopes RAG retrieval per topic and bounds each call's output), then concatenates. Warns if the gateway's `finish_reason` signals a truncated section. |
+| `src/docx_writer.py` | `write_docx` — renders the report into the branded Word template (`assets/tia_template.docx`): fills the cover with the customer's Organisation and assessment date, maps the Markdown to native Word styles. Falls back to a blank document if the template is missing. |
 | `src/logging_setup.py` | `configure_logging` + `bootstrap` (.env load + required-var check + logging). |
 | `src/http_resilient.py` | `call_resilient` — hard wall-clock cap + bounded retry around each gateway call so a stall can't hang the run. |
 
@@ -188,6 +190,12 @@ foreach ($d in $dirs) { New-Item -ItemType Directory -Force "$base\$d" | Out-Nul
 Change `$base` if you want a different root — make sure the `.env` paths
 match.
 
+If the working-dir root is a **OneDrive-synced folder** (the production
+layout — see [ADMIN_GUIDE.md](ADMIN_GUIDE.md)), right-click it in File
+Explorer and choose **"Always keep on this device"** so every synced file
+is fully downloaded; the pipeline cannot read online-only placeholder
+files under a service account.
+
 ### 5. Configure `.env`
 
 ```powershell
@@ -237,8 +245,8 @@ Every variable listed below is required in `.env` (the entry point's
 |----------|---------|---------|
 | `INPUT_DIR` | Customer responses to be processed — JSON form exports and/or xlsx/xlsm workbooks. | `run.py` |
 | `INTERMEDIATE_JSON_DIR` | Per-sheet JSON output from customer conversion. Wiped before each customer file is processed. | `run.py`, `tia_generator.py` |
-| `PROCESSING_DIR` | In-flight customer xlsx (claimed but not yet graduated). | `run.py` |
-| `PROCESSED_DIR` | Customer xlsx graduates here after successful conversion. | `run.py` |
+| `PROCESSING_DIR` | In-flight customer input file (claimed but not yet graduated). | `run.py` |
+| `PROCESSED_DIR` | Customer input files graduate here after successful processing. | `run.py` |
 | `OUTPUT_REPORT_DIR` | Generated `TIA_<stem>_<timestamp>.md` reports. | `run.py`, `tia_generator.py` |
 | `REFERENCE_TO_BE_LOADED_DIR` | Heterogeneous inbox: xlsx/xlsm reference workbooks AND passthrough files (e.g. *.pdf). Each file type is picked up by its own stage. | `reference_info_extractor.py`, `reference_passthrough_ingester.py` |
 | `REFERENCE_LOADED_DIR` | Successfully-ingested reference materials of **all types** graduate here. Holds the source xlsx (from stage 1) and the PDFs (from stage 1.5). Stage 2 scans this dir for passthrough files when building the sync-gate local set. | `reference_info_extractor.py`, `reference_passthrough_ingester.py`, `run.py` |
@@ -265,7 +273,10 @@ Every variable listed below is required in `.env` (the entry point's
 
 Once deployment is complete (see *Deployment / setup* above), day-to-day
 usage is built around scheduling `run.py` and dropping files into the
-inbox directories. This section walks an operator through the model.
+inbox directories. This section walks an operator through the model. For
+the end-to-end service protocol around the pipeline (form intake, the
+production schedule, review checklist, file lifecycle), see
+[ADMIN_GUIDE.md](ADMIN_GUIDE.md).
 
 ### Prerequisite
 
@@ -396,12 +407,12 @@ workbook**. The next `run.py` will, **for each input file**:
    > `finish_reason` reports a truncated section a `TIA output TRUNCATED`
    > WARNING is logged.
 
-Each customer workbook is processed **independently and sequentially** —
+Each customer file is processed **independently and sequentially** —
 `INTERMEDIATE_JSON_DIR` is wiped between files so each report is
 grounded in exactly one customer's data. After successful processing the
-source workbook graduates `INPUT_DIR → PROCESSING_DIR → PROCESSED_DIR`.
+source file graduates `INPUT_DIR → PROCESSING_DIR → PROCESSED_DIR`.
 If TIA generation fails for a file (e.g. gateway unreachable), the
-source xlsx is **left in `PROCESSING_DIR`** rather than graduating to
+source file is **left in `PROCESSING_DIR`** rather than graduating to
 `PROCESSED_DIR`, so the next scheduled run retries it.
 
 ### Logs
@@ -442,18 +453,22 @@ right setting.
 
 ### Where the tests live
 
-All tests sit in the `tests/` folder at the project root, one file per
-source module plus a smoke file:
+All tests sit in the `tests/` folder at the project root — one file per
+source module, an imports smoke file, and shared helpers:
 
 ```
 tests/
 ├── conftest.py                                # adds src/ to sys.path
+├── helpers.py                                 # shared test fakes
 ├── test_imports_smoke.py                      # every module imports cleanly
+├── test_docx_writer.py
 ├── test_excel_to_json.py
+├── test_http_resilient.py
 ├── test_logging_setup.py
 ├── test_rag_ingester.py
 ├── test_reference_sheet_extractor.py
 ├── test_reference_passthrough_ingester.py
+├── test_run.py
 └── test_tia_generator.py
 ```
 
@@ -523,6 +538,11 @@ same way as the full-suite command above. The leading
   multiple prior-duplicate cleanup, upload failure leaves file in
   inbox, listfiles failure aborts the stage, partial-batch failure rc
   semantics, non-pattern files ignored.
+- **`docx_writer` against the branded template** — cover fill
+  (Organisation Title, fixed Subtitle, assessment date), Markdown →
+  native Word style mapping (Heading 1/2, tables, bold runs),
+  missing-template fallback to a blank document, and output parent-dir
+  creation.
 
 ### Offline guarantee
 

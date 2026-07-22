@@ -4,3 +4,4 @@ __pycache__/
 venv/
 .env
 .pytest_cache/
+outreach_email_cs_directors.md
