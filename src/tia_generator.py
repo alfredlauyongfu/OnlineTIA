@@ -174,13 +174,13 @@ class TiaReportGenerator:
         ("Key Findings",
          "Begin with the exact heading line `## Key Findings`, then a numbered list "
          "of ONLY the 8-12 most significant FLAGGED items from the Assessment "
-         "Ledger (highest criticality first), plus at most 2 items from Positive "
-         "Confirmations worth acknowledging. Each flagged item: a bold lead line "
+         "Ledger (highest criticality first). Every item must be a flagged row: "
+         "never include a configuration that needs no action. Each item: a bold "
+         "lead line "
          "`**<Category> – <Subject> — <Criticality>**` with the criticality copied "
          "from the ledger row, then 1-2 short paragraphs of specifics — the "
          "customer's context, why it matters, and the suggested action, in the "
-         "advisory evidence-based tone. Positive-confirmation items instead start "
-         "their bold lead line with `✓ ` and carry no criticality. Do NOT cite "
+         "advisory evidence-based tone. Do NOT cite "
          "ledger row IDs (R1, R2, ...) anywhere. No table in this section."),
         ("General Information", _CODE_RENDERED),
         ("SQL Server", _CODE_RENDERED),
@@ -279,6 +279,17 @@ class TiaReportGenerator:
         r"the guidance|scoring guidance|the rubric|reference scoring", re.IGNORECASE
     )
 
+    # A section header typed into a question title or answer option instead of
+    # being made a section break — see `_strip_stray_section`. Anchored to the
+    # end and stopping at '?' so it can never eat a real question's wording.
+    _STRAY_SECTION_RE = re.compile(r"\s*\bSection:\s*[^?]*$")
+
+    # Ledger row IDs are internal machinery. The model sometimes cross-references
+    # them inside a Detail ("...no index maintenance (R14), no archiving (R19)"),
+    # which puts meaningless codes in front of the customer. Only the
+    # parenthesised citation form is removed, so prose is never mangled.
+    _LEDGER_CITE_RE = re.compile(r"\s*\((?:R\d+)(?:\s*,\s*R\d+)*\)")
+
     # Rubric-dense extraction files first, so the per-answer criticality maps
     # always survive the injection size cap even if inventory-style
     # extractions grow.
@@ -308,6 +319,12 @@ class TiaReportGenerator:
         # Customer form keys for the current generate() call — used by the
         # missing-subject guardrail. Set at the top of generate().
         self._customer_keys: list[str] = []
+        # {data key -> full question text the customer was asked}, from the
+        # form export. Drives the Detailed Assessment headings. Set in generate().
+        self._questions: dict[str, str] = {}
+        # {data key -> {"question", "answer"}} — the same fields with answers,
+        # used to backfill any ledger row the model omitted. Set in generate().
+        self._fields: dict[str, dict[str, str]] = {}
         # Cover metadata for the branded .docx — set at the top of generate().
         self._cover_org: str = "Customer"
         self._cover_date: str = ""
@@ -326,11 +343,18 @@ class TiaReportGenerator:
             raise TiaGenerationError(
                 f"No .json files in {customer_json_dir}; nothing to report on"
             )
-        # Every top-level key across the customer files must appear as a Subject
+        # Every question key across the customer files must appear as a Subject
         # in the report; the missing-subject guardrail checks this after assembly.
-        self._customer_keys = [
-            k for v in customer_content.values() if isinstance(v, dict) for k in v
-        ]
+        self._fields = self._extract_fields(customer_content)
+        self._questions = {k: v["question"] for k, v in self._fields.items()}
+        if not self._questions:
+            raise TiaGenerationError(
+                f"No question entries in {customer_json_dir}: every answer must be "
+                'a nested {"question": ..., "answer": ...} object. This export '
+                "predates the Power Automate flow update — regenerate it from the "
+                "current flow."
+            )
+        self._customer_keys = list(self._questions)
         self._cover_org, self._cover_date = self._extract_cover_meta(customer_content)
 
         logger.info(
@@ -402,17 +426,9 @@ class TiaReportGenerator:
         # The Detailed Assessment blocks are rendered in code from this ledger
         # (one block per row), so coverage is guaranteed; the narrative sections
         # (Summary, Key Findings, Outstanding Questions) are still LLM calls.
-        ledger_rows = self._parse_ledger(analysis)
-        known = {c.lower() for c in self._DETAILED_CATEGORIES}
-        unknown = sorted({
-            r["category"] for r in ledger_rows
-            if r["category"].strip().lower() not in known
-        })
-        if unknown:
-            logger.warning(
-                "ledger has row(s) in %d unknown categ/ies (not rendered): %s",
-                len(unknown), ", ".join(unknown),
-            )
+        ledger_rows = self._normalise_categories(
+            self._backfill_missing_rows(self._parse_ledger(analysis), self._fields)
+        )
         logger.info("ledger parsed: %d row(s) across the assessment", len(ledger_rows))
 
         section_texts: list[str] = []
@@ -423,10 +439,16 @@ class TiaReportGenerator:
                 "TIA section %d/%d: %s", i, len(self.REPORT_SECTIONS), title,
             )
             if title in self._DETAILED_CATEGORIES:
-                section_texts.append(
-                    self._render_category(title, ledger_rows, first=not detailed_opened)
+                rendered = self._render_category(
+                    title, ledger_rows, first=not detailed_opened,
+                    questions=self._questions,
                 )
-                detailed_opened = True
+                # An empty category renders as "" and is dropped at assembly, but
+                # the placeholder is still appended: `_reconcile_summary_counts`
+                # maps section_texts onto REPORT_SECTIONS by position.
+                section_texts.append(rendered)
+                if rendered:
+                    detailed_opened = True
                 continue
             message = data_block + canonical + self._section_directive(title, hint)
             try:
@@ -521,6 +543,7 @@ class TiaReportGenerator:
             # Detail is the last column; any extra pipes belong to it — rejoin
             # them so a Detail containing '|' survives round-trip.
             detail = " | ".join(cells[6:]).strip() if len(cells) > 6 else ""
+            detail = cls._LEDGER_CITE_RE.sub("", detail).strip()
             crit = criticality if criticality in cls.CRITICALITY_LEVELS else None
             # Dash placeholders ("—"/"-") mean "no value" — normalise them to
             # blank so a heading falls back Question → Subject correctly (some
@@ -537,6 +560,83 @@ class TiaReportGenerator:
             })
         return rows
 
+    @classmethod
+    def _detailed_categories_in_order(cls) -> list[str]:
+        """The seven rendered categories in report order. `_DETAILED_CATEGORIES`
+        is a frozenset, so matching against it must not rely on its iteration
+        order — this derives a stable sequence from REPORT_SECTIONS."""
+        return [t for t, _ in cls.REPORT_SECTIONS if t in cls._DETAILED_CATEGORIES]
+
+    @classmethod
+    def _normalise_categories(cls, rows: list[dict]) -> list[dict]:
+        """Map every ledger row onto one of the seven rendered categories.
+
+        `_render_category` matches on the exact category name, so a row the model
+        labelled slightly differently — "Runtime Resources" for "Runtime Resources
+        (Robots)" — matches nothing and its question silently disappears from the
+        report. (`_backfill_missing_rows` cannot catch it: the row exists, it is
+        just mislabelled.) Matching is exact first, then containment either way,
+        then General Information as a last resort so no row is ever lost.
+        """
+        ordered = cls._detailed_categories_in_order()
+        by_lower = {c.lower(): c for c in ordered}
+        repaired: list[str] = []
+        for r in rows:
+            raw = r["category"].strip()
+            exact = by_lower.get(raw.lower())
+            if exact:
+                r["category"] = exact
+                continue
+            match = next(
+                (c for c in ordered
+                 if raw and (raw.lower() in c.lower() or c.lower() in raw.lower())),
+                "General Information",
+            )
+            repaired.append(f"{raw or '(blank)'} -> {match}")
+            r["category"] = match
+        if repaired:
+            logger.warning(
+                "ledger category repair: %d row(s) carried a category that is not "
+                "one of the seven rendered sections and would have been dropped "
+                "from the report; remapped: %s",
+                len(repaired), "; ".join(sorted(set(repaired))),
+            )
+        return rows
+
+    @classmethod
+    def _backfill_missing_rows(
+        cls, rows: list[dict], fields: dict[str, dict[str, str]]
+    ) -> list[dict]:
+        """Guarantee one ledger row per customer question.
+
+        Coverage must not depend on the model remembering every key — when it
+        drops one, the question would vanish from the report entirely. Any key
+        with no row is appended here as an unflagged row built from the customer's
+        own data, so it still renders. Orphans land in General Information: a
+        visibly-present row in a plausible category beats a silently missing one.
+        A WARNING names them, since a non-empty backfill means the analysis pass
+        under-produced and the prompt may need attention.
+        """
+        seen = {r["subject"] for r in rows}
+        missing = [key for key in fields if key not in seen]
+        if not missing:
+            return rows
+        logger.warning(
+            "ledger backfill: %d question(s) had no ledger row and were added "
+            "unflagged under General Information: %s",
+            len(missing), ", ".join(missing),
+        )
+        for key in missing:
+            rows.append({
+                "category": "General Information",
+                "subject": key,
+                "question": fields[key]["question"],
+                "answer": fields[key]["answer"] or "not provided",
+                "criticality": None,
+                "detail": "",
+            })
+        return rows
+
     @staticmethod
     def _blank_if_dash(value: str) -> str:
         """Normalise a dash/empty placeholder to '' (so heading fall-through
@@ -544,24 +644,37 @@ class TiaReportGenerator:
         return "" if value.strip() in ("", "—", "–", "-") else value.strip()
 
     @classmethod
-    def _render_category(cls, category: str, rows: list[dict], *, first: bool) -> str:
+    def _render_category(
+        cls, category: str, rows: list[dict], *, first: bool,
+        questions: dict[str, str] | None = None,
+    ) -> str:
         """Render one Detailed Assessment category section in code from the
         ledger rows assigned to it — one numbered Q&A block per row (full
         question as the heading, criticality suffix when flagged, Answer line,
         Recommendation line only when flagged). The first category also opens
-        the parent `## Detailed Assessment` heading."""
+        the parent `## Detailed Assessment` heading.
+
+        `questions` maps each customer data key to the exact wording the customer
+        was asked. Because a ledger row's Subject is that key copied
+        character-for-character, the heading is looked up there first — so it is
+        the form's own wording rather than the model's transcription of it.
+        """
         cat_rows = [
             r for r in rows if r["category"].strip().lower() == category.lower()
         ]
+        # A category the questionnaire has no questions for is omitted entirely —
+        # a stub section reading "No questions in this category" looks like a
+        # fault in a customer-facing report. The caller skips empty results, so
+        # the parent heading moves to the first category that has content.
+        if not cat_rows:
+            return ""
         out: list[str] = []
         if first:
             out += ["## Detailed Assessment", "", _DETAILED_ASSESSMENT_LEAD, ""]
         out += [f"### {category}", ""]
-        if not cat_rows:
-            out.append("No questions in this category.")
-            return "\n".join(out)
         for n, r in enumerate(cat_rows, start=1):
-            heading = r["question"] or r["subject"]
+            from_form = (questions or {}).get(r["subject"], "")
+            heading = from_form or r["question"] or r["subject"]
             crit = f" — {r['criticality']}" if r["criticality"] else ""
             out.append(f"**{n}. {heading}{crit}**")
             out.append(f"Answer: {r['answer']}")
@@ -627,8 +740,61 @@ class TiaReportGenerator:
 
     # ---- internals ----
 
+    @classmethod
+    def _extract_fields(cls, customer_content: dict[str, Any]) -> dict[str, dict[str, str]]:
+        """Map each customer data key to its `{"question", "answer"}` pair.
+
+        Only nested `{"question": ..., "answer": ...}` entries are questions;
+        flat values (e.g. the Forms-generated "Submission time") are metadata and
+        are excluded, so they never become an assessment block.
+        """
+        fields: dict[str, dict[str, str]] = {}
+        stripped: list[str] = []
+        for payload in customer_content.values():
+            if not isinstance(payload, dict):
+                continue
+            for key, entry in payload.items():
+                if not (isinstance(entry, dict) and "answer" in entry):
+                    continue
+                question, q_hit = cls._strip_stray_section(entry.get("question"))
+                answer, a_hit = cls._strip_stray_section(entry.get("answer"))
+                if q_hit or a_hit:
+                    stripped.append(key)
+                fields[key] = {"question": question, "answer": answer}
+        if stripped:
+            logger.warning(
+                "form defect: a 'Section:' header is embedded in the question text "
+                "or answer option of %d field(s) — stripped so it does not reach "
+                "the report, but it should be fixed in Microsoft Forms: %s",
+                len(stripped), ", ".join(stripped),
+            )
+        return fields
+
+    @classmethod
+    def _strip_stray_section(cls, value: Any) -> tuple[str, bool]:
+        """Remove a trailing `Section: ...` label from form content.
+
+        Two of the questionnaire's section headers were typed into a question
+        title and an answer option instead of being created as section breaks, so
+        they arrive glued to real content (e.g. `"Don't know\\nSection: Logging &
+        Data Management"`). Left alone they surface verbatim in customer-facing
+        report headings and answers. Returns (cleaned, was_stripped).
+        """
+        text = str(value or "").strip()
+        cleaned = cls._STRAY_SECTION_RE.sub("", text).strip()
+        return (cleaned or text), cleaned != text
+
     @staticmethod
-    def _extract_cover_meta(customer_content: dict[str, Any]) -> tuple[str, str]:
+    def _field_value(payload: dict[str, Any], key: str) -> str | None:
+        """Read one field's answer, accepting the nested question/answer object.
+        Metadata fields are plain values, so those are returned as-is."""
+        entry = payload.get(key)
+        if isinstance(entry, dict):
+            entry = entry.get("answer")
+        return None if entry is None or entry == "" else str(entry)
+
+    @classmethod
+    def _extract_cover_meta(cls, customer_content: dict[str, Any]) -> tuple[str, str]:
         """Pull the Organisation and assessment date for the .docx cover from the
         customer form data. Falls back to 'Customer' / today's date when absent."""
         org: str | None = None
@@ -636,9 +802,9 @@ class TiaReportGenerator:
         for v in customer_content.values():
             if not isinstance(v, dict):
                 continue
-            org = org or (v.get("Organisation") or None)
-            if date is None and v.get("Submission time"):
-                raw = str(v["Submission time"])
+            org = org or cls._field_value(v, "Organisation")
+            raw = cls._field_value(v, "Submission time")
+            if date is None and raw:
                 try:
                     date = dt.datetime.fromisoformat(
                         raw.replace("Z", "+00:00")
@@ -721,7 +887,10 @@ class TiaReportGenerator:
         body = json.dumps(customer_content, ensure_ascii=False, indent=2)
         return (
             "Generate the Technical Infrastructure Assessment for the following customer.\n\n"
-            "Customer data (each key is a source filename; each value is the parsed JSON):\n\n"
+            "Customer data (each key is a source filename; each value is the parsed JSON). "
+            'Within a file, each answered field is {"question": <the exact wording the '
+            'customer was asked>, "answer": <their response>}; any plain value is '
+            "submission metadata, not a question, and gets no assessment row:\n\n"
             f"```json\n{body}\n```\n"
         )
 
@@ -753,25 +922,35 @@ class TiaReportGenerator:
             "must be a row here, and later sections may not add rows beyond it. "
             "Category must be exactly one of: General Information, SQL Server, "
             "Application Server(s), Interactive Clients, Runtime Resources "
-            "(Robots), Disaster Recovery, Security. Assign each question to the "
-            "topically closest category — never dump leftovers into Runtime "
-            "Resources. Anchors: administrative fields (submission time, booking "
-            "ID, contact name, email, organisation — never flagged), Environment, "
-            "Blue Prism version, and free-text catch-alls such as 'Anything else' "
-            "go under General Information; database configuration (hosting, "
-            "dedication, size, statistics, index maintenance, connection "
-            "encryption, latency) under SQL Server; backup and recovery questions "
-            "under Disaster Recovery; dev/prod environment parity under "
-            "Interactive Clients; authentication and antivirus/endpoint-protection "
-            "questions under Security. Criticality is exactly one of the four "
+            "(Robots), Disaster Recovery, Security. Assign every question using "
+            "these anchors, which between them cover the whole questionnaire. "
+            "General Information: administrative fields (booking ID, contact "
+            "name, email, organisation — never flagged), Environment, Blue Prism "
+            "version, total process/object count, and free-text catch-alls such "
+            "as 'Anything else'. SQL Server: database hosting, dedication, size "
+            "and growth, statistics, index maintenance, SQL connection "
+            "encryption, Application-Server-to-SQL-Server latency, ALL session "
+            "logging settings (levels, Unicode, archiving), and Data Gateways. "
+            "Application Server(s): Application Server hosting and count, load "
+            "balancer, server connection mode, encryption-scheme key storage. "
+            "Interactive Clients: Interactive Client hosting, Controller count, "
+            "dev/prod environment parity, and "
+            "Application-Server-to-Interactive-Client latency. Runtime Resources "
+            "(Robots): Runtime Resource hosting and count, Login Agent, and "
+            "environment monitoring. Disaster Recovery: backup and recovery "
+            "questions — the database backup-method question concerns the "
+            "database but belongs HERE, never under SQL Server. "
+            "Security: Runtime Resource authentication and "
+            "antivirus/endpoint protection. Every one of the seven categories has "
+            "at least one question above, so none should come out empty, and none "
+            "is a catch-all for leftovers. Criticality is exactly one of the four "
             "assessment categories from the system prompt for rows needing action, "
             "or the single character — for rows needing none. Subject is the "
             "customer's data key copied CHARACTER-FOR-CHARACTER — never reworded, "
             "reformatted, merged, or repeated in another category. Question is the "
-            "FULL question text from the matched REFERENCE SCORING GUIDANCE item's "
-            "'question' field (the complete wording the customer was asked); leave "
-            "Question blank when the item has no reference question (e.g. "
-            "administrative fields). Answer is their answer (verbatim, abbreviated "
+            "key's own 'question' field from the customer data (the exact wording "
+            "the customer was asked), copied verbatim; leave Question blank only "
+            "when that field is absent or empty. Answer is their answer (verbatim, abbreviated "
             "if long); Detail is the recommendation in at most 2 short sentences, "
             "filled ONLY for flagged rows and phrased per the tone rules — the "
             "observed gap and its consequence, then the advisory suggestion. "
@@ -784,9 +963,6 @@ class TiaReportGenerator:
             "uncertainty itself and the Detail says what to confirm and why it "
             "matters; a row flagged this way is NOT repeated in Outstanding "
             "Questions.\n\n"
-            "## Positive Confirmations\n"
-            "At most 5 one-line bullets of explicitly-stated customer configurations "
-            "that follow best practice and are worth acknowledging.\n\n"
             "## Criticality Tally\n"
             "Four lines, one per criticality, in this exact form:\n"
             "Red Flag: N (R_, R_, ...)\n"
@@ -817,8 +993,8 @@ class TiaReportGenerator:
         return (
             "\nThis is the ANALYSIS VERIFICATION phase. Below is a DRAFT canonical "
             "analysis. Audit it and re-output a CORRECTED version in the SAME "
-            "four-part format (## Environment Facts, ## Assessment Ledger, "
-            "## Positive Confirmations, ## Criticality Tally).\n\n"
+            "three-part format (## Environment Facts, ## Assessment Ledger, "
+            "## Criticality Tally).\n\n"
             "Rules:\n"
             "- Keep every well-grounded row unchanged — same Category, Criticality, "
             "and wording. If you remove rows, renumber the remaining IDs "
@@ -937,8 +1113,11 @@ class TiaReportGenerator:
     @classmethod
     def _assemble_report(cls, section_texts: list[str]) -> str:
         """Join the per-section Markdown into one document with a title header
-        and horizontal rules between sections."""
-        return cls.REPORT_TITLE + "\n---\n\n" + "\n\n---\n\n".join(section_texts) + "\n"
+        and horizontal rules between sections. Empty sections (a Detailed
+        Assessment category the questionnaire has no questions for) are dropped
+        here, so they leave no heading and no stray horizontal rule."""
+        sections = [s for s in section_texts if s.strip()]
+        return cls.REPORT_TITLE + "\n---\n\n" + "\n\n---\n\n".join(sections) + "\n"
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:

@@ -163,6 +163,7 @@ For the full list see the README's *Troubleshooting* section. The common operati
 | Log shows `[Errno 22] Invalid argument` reading an input, or `online-only placeholder` | The input is a OneDrive placeholder that isn't downloaded locally. Right-click the `Online TIA` folder → **"Always keep on this device"** (see *Where the data lives*), and confirm the OneDrive client is running and signed in. Re-run manually once fixed. |
 | Report contains an `INCOMPLETE REPORT` banner | A section failed part-way through generation. The source file is kept so the next run regenerates the full report. |
 | No report for a submission | Search `Logs\logs.txt` for that Booking ID. Usual causes: the gateway was down, or the JSON was malformed. |
+| Log shows `predates the Power Automate flow update` | The submission was exported by the old flow, which wrote answers as plain values. The agent now requires each answer to carry its question. Re-export that submission from the current flow (or re-run the flow for it); the file stays in `Processing` meanwhile. |
 | A reference-file update didn't take effect | Confirm the file is in `ReferenceToBeLoaded`; check the log's RAG-sync / passthrough lines; after a successful run it should have graduated to `ReferenceLoaded`. |
 
 ## Housekeeping, data handling & boundaries

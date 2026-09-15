@@ -25,6 +25,16 @@ def _make_gen(tmp_path: Path) -> TiaReportGenerator:
     )
 
 
+def _customer_json(answers: dict[str, str] | None = None) -> str:
+    """A form export in the Power Automate flow's shape: submission metadata as a
+    plain value, plus one {"question", "answer"} object per answered field."""
+    answers = {"SQL connection encrypted": "No"} if answers is None else answers
+    payload: dict = {"Submission time": "2026-07-04T20:22:06Z"}
+    for key, answer in answers.items():
+        payload[key] = {"question": f"{key}? (full form wording)", "answer": answer}
+    return json.dumps(payload)
+
+
 def _ledger_analysis(rows) -> str:
     """A canonical-analysis string with a parseable `## Assessment Ledger`.
     `rows` = list of (category, subject, question, answer, criticality, detail);
@@ -81,6 +91,198 @@ def test_read_customer_content_empty_dir(tmp_path: Path) -> None:
     src = tmp_path / "src"
     src.mkdir()
     assert TiaReportGenerator._read_customer_content(src) == {}
+
+
+# ---------- form-export shape: questions, cover meta, old-format rejection ----------
+
+def _export(fields: dict) -> dict[str, dict]:
+    """customer_content as _read_customer_content returns it, for one file."""
+    return {"a.json": fields}
+
+
+def test_extract_fields_maps_key_to_question_and_answer() -> None:
+    fields = TiaReportGenerator._extract_fields(_export({
+        "Submission time": "2026-07-04T20:22:06Z",
+        "Database hosting": {"question": "What infrastructure hosts your Blue Prism "
+                                         "database?", "answer": "Physical server"},
+        "Antivirus": {"question": "Is antivirus enabled?", "answer": ""},
+    }))
+    # Metadata (a plain value) is not a question and gets no entry.
+    assert fields == {
+        "Database hosting": {
+            "question": "What infrastructure hosts your Blue Prism database?",
+            "answer": "Physical server"},
+        "Antivirus": {"question": "Is antivirus enabled?", "answer": ""},
+    }
+
+
+def test_extract_fields_strips_stray_section_headers() -> None:
+    """Two of the form's section headers were typed into a question title and an
+    answer option; they must not reach customer-facing report text."""
+    fields = TiaReportGenerator._extract_fields(_export({
+        "Process and Object count": {
+            "question": "How many Processes and Objects do you have in total? "
+                        "(Run the report.) Section: Database & SQL Server",
+            "answer": "1,193"},
+        "Encryption key storage": {
+            "question": "Where are your encryption-scheme keys stored?",
+            "answer": "Don't know\nSection: Logging & Data Management"},
+    }))
+    assert fields["Process and Object count"]["question"] == (
+        "How many Processes and Objects do you have in total? (Run the report.)")
+    assert fields["Encryption key storage"]["answer"] == "Don't know"
+
+
+def test_extract_fields_leaves_normal_content_untouched() -> None:
+    """The stripper stops at '?' so it can never truncate real question wording."""
+    fields = TiaReportGenerator._extract_fields(_export({
+        "Q": {"question": "Which Section: A or B do you use? (Pick one.)",
+              "answer": "Section: A"},
+    }))
+    assert fields["Q"]["question"] == "Which Section: A or B do you use? (Pick one.)"
+    assert fields["Q"]["answer"] == "Section: A"
+
+
+def test_extract_fields_ignores_flat_old_format() -> None:
+    """A pre-flow-update export yields no questions — which is what makes
+    generate() reject it rather than silently assess nothing."""
+    assert TiaReportGenerator._extract_fields(
+        _export({"Database hosting": "Physical server"})) == {}
+
+
+def test_backfill_adds_rows_for_questions_the_ledger_dropped() -> None:
+    """Coverage is code-enforced: a question the model omitted still gets a row,
+    built from the customer's own data and left unflagged."""
+    rows = [{"category": "SQL Server", "subject": "Database hosting",
+             "question": "q", "answer": "Physical server",
+             "criticality": "Red Flag", "detail": "d"}]
+    fields = {
+        "Database hosting": {"question": "q", "answer": "Physical server"},
+        "Login Agent": {"question": "Do you use Login Agent?", "answer": "Yes"},
+        "Monitoring": {"question": "Do you monitor?", "answer": ""},
+    }
+    out = TiaReportGenerator._backfill_missing_rows(rows, fields)
+    assert len(out) == 3
+    added = {r["subject"]: r for r in out if r["subject"] != "Database hosting"}
+    assert added["Login Agent"]["answer"] == "Yes"
+    assert added["Login Agent"]["criticality"] is None
+    assert added["Monitoring"]["answer"] == "not provided"   # blank -> placeholder
+    # The row the model did produce is untouched.
+    assert out[0]["criticality"] == "Red Flag"
+
+
+def test_parse_ledger_strips_internal_id_citations() -> None:
+    """Ledger IDs are internal; a Detail citing them would print "(R14)" to the
+    customer. Only the parenthesised citation is removed."""
+    analysis = _ledger_analysis([
+        ("SQL Server", "Anything else", "q", "slow", "Red Flag",
+         "No index maintenance (R14), no archiving (R19, R23) are to blame."),
+    ])
+    detail = TiaReportGenerator._parse_ledger(analysis)[0]["detail"]
+    assert detail == "No index maintenance, no archiving are to blame."
+
+
+def test_render_category_omits_a_category_with_no_questions() -> None:
+    """An empty category is dropped rather than rendered as a stub section."""
+    assert TiaReportGenerator._render_category("Disaster Recovery", [], first=False) == ""
+
+
+def test_assemble_report_drops_empty_sections_without_stray_rules() -> None:
+    """An omitted category must not leave a dangling `---` separator behind."""
+    md = TiaReportGenerator._assemble_report(["## Summary\nx", "", "## Security\ny"])
+    assert "## Summary" in md and "## Security" in md
+    assert "---\n\n---" not in md
+    assert md.count("\n---\n") == 2      # title rule + one between the two sections
+
+
+def test_normalise_categories_repairs_a_near_miss_name() -> None:
+    """"Runtime Resources" must land in "Runtime Resources (Robots)" — an exact
+    match is required to render, so a near-miss would drop the question."""
+    rows = [{"category": "Runtime Resources", "subject": "s", "question": "q",
+             "answer": "a", "criticality": None, "detail": ""}]
+    assert (TiaReportGenerator._normalise_categories(rows)[0]["category"]
+            == "Runtime Resources (Robots)")
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("SQL Server", "SQL Server"),                       # exact
+    ("sql server", "SQL Server"),                       # case-insensitive
+    ("Application Server", "Application Server(s)"),    # shortened
+    ("Runtime Resources (Robots) — extra", "Runtime Resources (Robots)"),
+    ("Totally Unrelated", "General Information"),       # last resort
+    ("", "General Information"),                        # blank
+])
+def test_normalise_categories_matching(raw: str, expected: str) -> None:
+    rows = [{"category": raw, "subject": "s", "question": "q", "answer": "a",
+             "criticality": None, "detail": ""}]
+    assert TiaReportGenerator._normalise_categories(rows)[0]["category"] == expected
+
+
+def test_normalise_categories_never_drops_a_row() -> None:
+    """Whatever the model wrote, every row survives into a rendered category."""
+    rows = [{"category": c, "subject": f"s{i}", "question": "q", "answer": "a",
+             "criticality": None, "detail": ""}
+            for i, c in enumerate(["Runtime Resources", "Nonsense", "Security"])]
+    out = TiaReportGenerator._normalise_categories(rows)
+    assert len(out) == 3
+    assert all(r["category"] in TiaReportGenerator._DETAILED_CATEGORIES for r in out)
+
+
+def test_backfill_is_a_noop_when_every_question_has_a_row() -> None:
+    rows = [{"category": "SQL Server", "subject": "Database hosting",
+             "question": "q", "answer": "a", "criticality": None, "detail": ""}]
+    fields = {"Database hosting": {"question": "q", "answer": "a"}}
+    assert TiaReportGenerator._backfill_missing_rows(rows, fields) == rows
+
+
+def test_extract_cover_meta_reads_nested_answers() -> None:
+    org, date = TiaReportGenerator._extract_cover_meta(_export({
+        "Submission time": "2026-07-04T20:22:06Z",
+        "Organisation": {"question": "Your organisation / business unit.",
+                         "answer": "Acme Corporation"},
+    }))
+    assert org == "Acme Corporation"
+    assert date == "04 July 2026"
+
+
+def test_extract_cover_meta_falls_back_when_absent() -> None:
+    org, date = TiaReportGenerator._extract_cover_meta(_export({"Q": {"answer": "x"}}))
+    assert org == "Customer"
+    assert date  # today's date, format-checked elsewhere
+
+
+def test_generate_rejects_old_flat_export(tmp_path: Path) -> None:
+    """Clean break: a pre-flow-update export fails loudly, naming the cause,
+    instead of being assessed with no questions."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a.json").write_text(json.dumps({"Booking ID": "id1234",
+                                            "Database hosting": "Physical server"}),
+                                encoding="utf-8")
+    with pytest.raises(TiaGenerationError) as exc:
+        _make_gen(tmp_path).generate(src, filename_prefix="TIA_test")
+    assert "predates the Power Automate flow update" in str(exc.value)
+
+
+def test_render_category_heading_prefers_form_wording() -> None:
+    """The heading comes from the questions map (keyed by the row's Subject),
+    falling back to the ledger's Question, then the Subject itself."""
+    rows = [
+        {"category": "SQL Server", "subject": "Database hosting",
+         "question": "model's paraphrase", "answer": "Physical server",
+         "criticality": None, "detail": ""},
+        {"category": "SQL Server", "subject": "Unmapped key",
+         "question": "ledger question", "answer": "x",
+         "criticality": None, "detail": ""},
+    ]
+    out = TiaReportGenerator._render_category(
+        "SQL Server", rows, first=False,
+        questions={"Database hosting": "What infrastructure hosts your database?"},
+    )
+    assert "**1. What infrastructure hosts your database?**" in out
+    assert "model's paraphrase" not in out
+    # No mapping for this key -> the ledger's Question is used.
+    assert "**2. ledger question**" in out
 
 
 # ---------- _build_user_message ----------
@@ -311,8 +513,7 @@ def test_generate_produces_all_sections(tmp_path, monkeypatch) -> None:
     ledger. The 7 categories are NOT LLM calls."""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text(json.dumps({"SQL connection encrypted": "No"}),
-                                encoding="utf-8")
+    (src / "a.json").write_text(_customer_json({"SQL connection encrypted": "No"}), encoding="utf-8")
     gen = _make_gen(tmp_path)
 
     seen_sections: list[str] = []
@@ -344,7 +545,10 @@ def test_generate_produces_all_sections(tmp_path, monkeypatch) -> None:
         assert h in text
     # The code-rendered category block came from the ledger.
     assert "### SQL Server" in text
-    assert "Are the connections secured? — Red Flag" in text
+    # The heading is the form's own wording (from the export), NOT the ledger's
+    # Question column — the ledger said "Are the connections secured?".
+    assert "SQL connection encrypted? (full form wording) — Red Flag" in text
+    assert "Are the connections secured?" not in text
     assert f"## {TiaReportGenerator.ANALYSIS_LABEL}" not in text
 
 
@@ -353,7 +557,7 @@ def test_generate_also_writes_sibling_docx(tmp_path, monkeypatch) -> None:
     same stem (independent, best-effort Word output)."""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text("{}", encoding="utf-8")
+    (src / "a.json").write_text(_customer_json(), encoding="utf-8")
     gen = _make_gen(tmp_path)
 
     def fake_call(self, user_message, section=None, read_timeout=None):
@@ -373,7 +577,7 @@ def test_generate_writes_partial_report_on_section_failure(tmp_path, monkeypatch
     defers the file) — completed work is not discarded."""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text("{}", encoding="utf-8")
+    (src / "a.json").write_text(_customer_json(), encoding="utf-8")
     gen = _make_gen(tmp_path)
 
     fail_on = "Key Findings"   # an LLM section (categories can't fail — code-rendered)
@@ -405,7 +609,7 @@ def test_generate_docx_failure_does_not_break_md(tmp_path, monkeypatch) -> None:
     return value is the .md, and no exception escapes (decoupled outputs)."""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text("{}", encoding="utf-8")
+    (src / "a.json").write_text(_customer_json(), encoding="utf-8")
     gen = _make_gen(tmp_path)
     monkeypatch.setattr(
         TiaReportGenerator, "_call_rag_chat",
@@ -430,7 +634,7 @@ def test_generate_injects_verified_analysis_into_every_section(tmp_path, monkeyp
     the authoritative source of truth."""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text("{}", encoding="utf-8")
+    (src / "a.json").write_text(_customer_json(), encoding="utf-8")
     gen = _make_gen(tmp_path)
 
     section_prompts: dict[str, str] = {}
@@ -478,7 +682,7 @@ def test_generate_strips_section_code_fences(tmp_path, monkeypatch) -> None:
     assembly, so the final doc has no stray fences."""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text("{}", encoding="utf-8")
+    (src / "a.json").write_text(_customer_json(), encoding="utf-8")
     gen = _make_gen(tmp_path)
 
     def fake_call(self, user_message, section=None, read_timeout=None):
@@ -600,8 +804,9 @@ def test_render_category_one_block_per_row() -> None:
     assert "Recommendation: Encrypt it | now." in sql
     assert "**2. How big is it?**" in sql                 # numbering restarts, unflagged
 
+    # A category with no ledger rows is omitted entirely, not stubbed out.
     dr = TiaReportGenerator._render_category("Disaster Recovery", rows, first=False)
-    assert "No questions in this category." in dr
+    assert dr == ""
 
 
 def test_render_category_block_count_equals_rows() -> None:
@@ -615,7 +820,9 @@ def test_analysis_directive_three_part_ledger() -> None:
     d = TiaReportGenerator._analysis_directive()
     assert "## Environment Facts" in d
     assert "## Assessment Ledger" in d
-    assert "## Positive Confirmations" in d
+    # Positives were dropped: nothing consumes them, and a findings report should
+    # not spend analysis tokens on configurations that need no action.
+    assert "Positive Confirmations" not in d
     assert "ID | Category | Subject | Question | Answer | Criticality | Detail" in d
     assert "EVERY question" in d                          # exhaustive coverage
     assert "never flagged" in d                           # admin fields rule
@@ -625,20 +832,24 @@ def test_analysis_directive_three_part_ledger() -> None:
     assert "'Don't know'" in d                            # uncertain answers may be flagged
     assert "NOT repeated in Outstanding Questions" in d   # no double-counting
     assert "never merge two keys" in d                    # no fabricated/merged rows
-    assert "FULL question text from the matched REFERENCE SCORING GUIDANCE" in d
+    # Question wording now comes from the customer data's own 'question' field
+    # (carried by the form export), not from the reference scoring guidance.
+    assert "key's own 'question' field from the customer data" in d
     assert "Red Flag first" in d
     assert "EXHAUSTIVE and FINAL" in d                    # sections can't add rows
     assert "## Criticality Tally" in d                    # counts are copied, not derived
 
 
 def test_key_findings_hint_carries_criticality() -> None:
-    """Flagged Key Findings show their criticality; positives are ✓-prefixed."""
+    """Key Findings lists flagged items only, each showing its criticality —
+    positive confirmations are not a finding and must not appear there."""
     hints = dict(TiaReportGenerator.REPORT_SECTIONS)
     h = hints["Key Findings"]
     assert "## Key Findings" in h
     assert "`**<Category> – <Subject> — <Criticality>**`" in h
-    assert "✓" in h
-    assert "carry no criticality" in h
+    assert "never include a configuration that needs no action" in h
+    assert "Positive Confirmations" not in h
+    assert "✓" not in h
 
 
 def test_count_criticalities_tallies_block_headings() -> None:
@@ -696,7 +907,7 @@ def test_generate_count_table_matches_rendered_blocks(tmp_path, monkeypatch) -> 
     import re as _re
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text('{"q1": "v", "q2": "v"}', encoding="utf-8")
+    (src / "a.json").write_text(_customer_json({"q1": "v", "q2": "v"}), encoding="utf-8")
     gen = _make_gen(tmp_path)
 
     rows = [
@@ -901,7 +1112,7 @@ def test_generate_injects_guidance_into_analysis_and_verification_only(
     code-rendered category sections make no call at all)."""
     src = tmp_path / "src"
     src.mkdir()
-    (src / "a.json").write_text("{}", encoding="utf-8")
+    (src / "a.json").write_text(_customer_json(), encoding="utf-8")
     gen = TiaReportGenerator(
         base_url="https://example.invalid", api_key="k", llm_model="m",
         output_dir=tmp_path / "out",

@@ -75,7 +75,7 @@ logger = logging.getLogger(__name__)
 def report_prefix(source: Path) -> str:
     """Filename prefix for the TIA report generated from `source`.
 
-    JSON form exports are named from their "Booking ID" field
+    JSON form exports are named from their "Booking ID" answer
     (`TIA_<bookingid>`); anything else — Excel inputs, a missing/non-string
     field, an unreadable file — falls back to the sanitized file stem.
     Never raises: report naming must not be able to fail the run.
@@ -84,11 +84,20 @@ def report_prefix(source: Path) -> str:
         try:
             with source.open("r", encoding="utf-8-sig") as f:
                 booking_id = json.load(f).get("Booking ID")
+            # Form exports nest each field as {"question": ..., "answer": ...}.
+            if isinstance(booking_id, dict):
+                booking_id = booking_id.get("answer")
             if isinstance(booking_id, str) and booking_id.strip():
                 return f"TIA_{ExcelToJsonConverter.safe_name(booking_id.strip())}"
         except Exception:
             pass  # fall through to the stem rule
-    return f"TIA_{ExcelToJsonConverter.safe_name(source.stem)}"
+    # The flow names submissions "TIA_<booking id>- <timestamp>.json", so a blank
+    # Booking ID sends us down the stem rule with a stem that already carries the
+    # prefix and an empty booking-id separator ("TIA_-_<timestamp>"). Drop both so
+    # the report is named "TIA_<timestamp>" rather than "TIA_TIA_-_<timestamp>".
+    stem = ExcelToJsonConverter.safe_name(source.stem)
+    core = (stem[4:] if stem.startswith("TIA_") else stem).strip("_-")
+    return f"TIA_{core}" if core else stem
 
 
 def main() -> int:

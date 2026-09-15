@@ -93,7 +93,7 @@ both share the same PROCESSING/PROCESSED lifecycle and per-file isolation:
 
 | Extension | Handling | Report name |
 |-----------|----------|-------------|
-| `.json` | **Form export** (flat question→answer object from the online TIA form). Validated (must parse as a JSON object; UTF-8 BOM tolerated) and staged as-is into `INTERMEDIATE_JSON_DIR`. | `TIA_<Booking ID>_<ts>.md` — falls back to the file stem if the `"Booking ID"` field is absent. |
+| `.json` | **Form export** from the online TIA form, written by the Power Automate flow. Each answered field is `{"question": <exact form wording>, "answer": <response>}`; plain values (e.g. `"Submission time"`) are submission metadata and get no assessment row. Validated (must parse as a JSON object; UTF-8 BOM tolerated) and staged as-is into `INTERMEDIATE_JSON_DIR`. | `TIA_<Booking ID>_<ts>.md` — falls back to the file stem if the `"Booking ID"` field is absent. |
 | `.xlsx`, `.xlsm` | **Workbook**: converted to one JSON per sheet (`{stem}__{sheet}.json`), reference-scaffolding sheets excluded downstream. | `TIA_<file stem>_<ts>.md` |
 
 The accepted patterns are `CUSTOMER_INPUT_PATTERNS` in `src/excel_to_json.py`.
@@ -276,7 +276,17 @@ usage is built around scheduling `run.py` and dropping files into the
 inbox directories. This section walks an operator through the model. For
 the end-to-end service protocol around the pipeline (form intake, the
 production schedule, review checklist, file lifecycle), see
-[ADMIN_GUIDE.md](ADMIN_GUIDE.md).
+[ADMIN_GUIDE.md](ADMIN_GUIDE.md). The intake chain that feeds the pipeline
+is recorded in [intake/online_tia_form.json](intake/online_tia_form.json) —
+the questionnaire's title, header text, sections, and every question with its
+answer options, so the form can be recreated from this repo.
+
+The Power Automate flow that turns a submission into the input JSON (and
+sends the confirmation email) is **not committed**: its export carries tenant
+and subscription GUIDs, the internal SharePoint path and staff email
+addresses, and this repository is public. Export it from Power Automate to
+`intake/power_automate_flow.json` to run the flow/form drift tests locally;
+they skip when the file is absent.
 
 ### Prerequisite
 
@@ -366,10 +376,11 @@ workbook**. The next `run.py` will, **for each input file**:
    additionally grounded by injecting the extracted reference scoring
    guidance (the per-answer criticality rubric from `REFERENCE_JSON_DIR`)
    directly into those calls — ratings come from the rubric, not from
-   RAG-retrieval luck or the model's general knowledge. The rubric also
-   carries each question's full wording, so the assessment blocks state
-   the complete question in their heading rather than the customer's short
-   form-label. Then the report's **four sections** — **Summary** (intro +
+   RAG-retrieval luck or the model's general knowledge. Each assessment
+   block's heading is the **exact question the customer was asked**, taken
+   in code from the form export's own `question` field (matched to the
+   ledger row by its data key) rather than from the model's transcription
+   of it. Then the report's **four sections** — **Summary** (intro +
    criticality count table), **Key Findings** (the most significant items),
    **Detailed Assessment** (one Q&A subsection per category: General
    Information, SQL Server, Application Server(s), Interactive Clients,
@@ -485,7 +496,7 @@ From the project root, using the venv-Python:
 & .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected output ends with `189 passed` (in a few seconds) and exit code 0. If you
+Expected output ends with `225 passed` (in a few seconds) and exit code 0. If you
 see a failure, the line immediately above the summary identifies the
 file and test name.
 

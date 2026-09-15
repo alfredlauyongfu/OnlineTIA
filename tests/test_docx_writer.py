@@ -7,7 +7,7 @@ from pathlib import Path
 
 from docx import Document
 
-from docx_writer import write_docx
+from docx_writer import COVER_SUBTITLE, write_docx
 
 
 _SECTION = "\n".join([
@@ -78,6 +78,52 @@ def test_write_docx_falls_back_when_template_missing(tmp_path: Path) -> None:
     assert out.exists()
     doc = Document(str(out))
     assert any("Are the connections secured?" in p.text for p in doc.paragraphs)
+
+
+def test_output_carries_no_source_document_remnants(tmp_path: Path) -> None:
+    """The template was derived from another organisation's report. No trace of
+    that organisation may reach a generated document — not in the running
+    headers, and not in the properties Word shows in File > Info and Explorer.
+
+    Asserted positively (headers hold only the report title, metadata is ours)
+    rather than by blacklisting the old text, so any foreign remnant is caught.
+    """
+    import re
+    import zipfile
+
+    z = zipfile.ZipFile(str(_write(tmp_path)))
+    core = z.read("docProps/core.xml").decode("utf-8")
+    title = re.search(r"<dc:title>([^<]*)</dc:title>", core)
+    assert title and title.group(1) == COVER_SUBTITLE
+    for tag in ("dc:subject", "cp:keywords", "cp:lastModifiedBy"):
+        m = re.search(rf"<{tag}>([^<]*)</{tag}>", core)
+        assert not (m and m.group(1).strip()), f"<{tag}> still carries source metadata"
+
+    for name in z.namelist():
+        if not re.match(r"word/header\d*\.xml", name):
+            continue
+        text = "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>",
+                                  z.read(name).decode("utf-8")))
+        leftover = text.replace(COVER_SUBTITLE, "").strip()
+        assert not leftover, f"{name} carries unexpected header text: {leftover!r}"
+
+
+def test_running_headers_are_static_text(tmp_path: Path) -> None:
+    """The running header must not be built from STYLEREF fields: cached they
+    read the report name, but Word re-resolves them on print/PDF to the cover
+    Title (the customer's organisation), silently changing the header. Page
+    numbering in the footer is a field and must survive."""
+    import re
+    import zipfile
+
+    z = zipfile.ZipFile(str(_write(tmp_path)))
+    for name in z.namelist():
+        if not re.match(r"word/header\d*\.xml", name):
+            continue
+        xml = z.read(name).decode("utf-8")
+        assert "STYLEREF" not in xml, f"{name} still resolves text from a style"
+        assert "<w:fldChar" not in xml, f"{name} still contains a field"
+    assert "PAGE" in z.read("word/footer3.xml").decode("utf-8")
 
 
 def test_write_docx_creates_parent_dir(tmp_path: Path) -> None:

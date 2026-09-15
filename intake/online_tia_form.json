@@ -1,0 +1,463 @@
+{
+  "source": {
+    "url": "https://forms.office.com/r/J9yBcDpfy9",
+    "extracted": "2026-09-15"
+  },
+  "title": "Blue Prism Online Technical\nInfrastructure Assessment",
+  "description": "Please note: this assessment is for Blue Prism Enterprise only.\n\nThis Technical Infrastructure Assessment applies exclusively to Blue Prism Enterprise deployments. It does NOT apply to Blue Prism Cloud. If your platform is Blue Prism Cloud, this assessment is not relevant to your environment — please do not complete this form.\n\nSS&C collects the information you provide in this form — including your name and contact details — solely to carry out and follow up on your Blue Prism Enterprise Technical Infrastructure Assessment. For details on how SS&C handles personal data, please see the SS&C Privacy Policy: https://www.ssctech.com/about/privacy",
+  "settings": {
+    "isAnonymous": true,
+    "permissionForResponder": 1,
+    "requiresUniqueResponse": false,
+    "isQuizMode": false,
+    "notRecordIdentity": false
+  },
+  "items": [
+    {
+      "kind": "section",
+      "title": ""
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "Booking ID. (From Knowledge Support booking confirmation mail.)",
+      "required": false,
+      "multiline": false,
+      "isNumber": false
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "Your name and role.",
+      "required": false,
+      "multiline": true,
+      "isNumber": false
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "Your work email address. (So we can follow up with you about your responses.)",
+      "required": false,
+      "multiline": false,
+      "isNumber": false
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "Your organisation / business unit.",
+      "required": false,
+      "multiline": true,
+      "isNumber": false
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Which Blue Prism environment do your answers describe? (Production or Non-production.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Production",
+        "UAT / Test",
+        "Development",
+        "Other"
+      ]
+    },
+    {
+      "kind": "section",
+      "title": "Section: Platform & Hosting Infrastructure"
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "What version of Blue Prism are you running? (See the About screen in the Blue Prism client. Example: 7.3.1)",
+      "required": false,
+      "multiline": true,
+      "isNumber": false
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What infrastructure hosts your Blue Prism database? (Check with your DBA if unsure.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Physical server",
+        "Virtual server (on-premises)",
+        "Public cloud VM - IaaS (Azure/AWS/Google Cloud)",
+        "Public cloud managed database - PaaS",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What infrastructure hosts your Application Server(s)?",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Physical server",
+        "Virtual server (on-premises)",
+        "Public cloud VM (Azure/AWS/Google Cloud)",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What infrastructure hosts your Interactive Clients? (Select all that apply.)",
+      "required": false,
+      "allowMultipleSelection": true,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Physical desktops or servers",
+        "Virtual servers or desktops",
+        "Public cloud VMs (Azure/AWS/Google Cloud)",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What infrastructure hosts your Runtime Resources / Digital Workers? (Select all that apply.)",
+      "required": false,
+      "allowMultipleSelection": true,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Physical desktops or servers",
+        "Virtual servers or desktops",
+        "Public cloud VMs (Azure/AWS/Google Cloud)",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "section",
+      "title": "Section: Scale & Sizing"
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "How many active, registered Runtime Resources / Digital Workers do you have? (See Control Room > Session Management, or System > Resources if you have access.)",
+      "required": false,
+      "multiline": true,
+      "isNumber": true
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "How many Application Servers do you have? (Check with your technical architect if unsure.)",
+      "required": false,
+      "multiline": true,
+      "isNumber": true
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Do you use a load balancer in front of your Application Servers? (Check with your technical architect if unsure.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": true,
+      "choices": [
+        "Yes - hardware appliance (F5, Citrix ADC, etc.)",
+        "Yes - Windows NLB",
+        "Yes - cloud load balancer",
+        "No",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "How many Controllers (Interactive Clients) have access to the Control Room in your Production environment?",
+      "required": false,
+      "multiline": true,
+      "isNumber": true
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "How many Processes and Objects do you have in total? (Run the “System” report under System > Reporting.) Section: Database & SQL Server",
+      "required": false,
+      "multiline": true,
+      "isNumber": true
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Does your SQL Server host other instances, databases, or applications, or is it dedicated to Blue Prism? (Check with your DBA if unsure.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Dedicated to Blue Prism",
+        "Shared with other databases or applications",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "What is the current size of your Blue Prism database, and roughly how fast is it growing? (Check with your DBA if unsure. Example: 250 GB, growing 10 GB/month.)",
+      "required": false,
+      "multiline": true,
+      "isNumber": false
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What database backup method does your deployment employ? (Select all that apply. Check with your DBA if unsure.)",
+      "required": false,
+      "allowMultipleSelection": true,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Full backups",
+        "Differential backups",
+        "Transaction-log backups",
+        "No regular backups",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Are Auto Create Statistics and Auto Update Statistics enabled for your Blue Prism database? (Check with your DBA if unsure.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Both enabled",
+        "Only Auto Create",
+        "Only Auto Update",
+        "Neither",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Does your Blue Prism database undergo regular index maintenance - specifically, are index rebuilds, reorganisations, and statistics updates proactively scheduled, or are they only performed reactively when performance degrades? (Check with your DBA if unsure.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Proactively scheduled",
+        "Reactive only - when performance degrades",
+        "No index maintenance",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "section",
+      "title": "Section: Connectivity & Encryption"
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Is the SQL connection from your Application Server to the Blue Prism database encrypted? (On the Application Server, check the Additional SQL Connection Parameters for “encrypt=true; trustservercertificate=true”, or confirm certificate-based encryption with your DBA.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Yes",
+        "No",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What is the network latency between your Application Server and SQL Server? (Test with a ping between the two servers.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "0-5 ms",
+        "5-20 ms",
+        "20 ms or more",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What is the network latency between your Application Server and Interactive Client? (Test with a ping between the two servers.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "0-5 ms",
+        "5-20 ms",
+        "20 ms or more",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What server connection mode are your Interactive Clients and Runtime Resources using to reach the Blue Prism Server? (Check an Interactive Client's “Configure Connection” before login. The .NET Remoting modes are legacy options retained for backwards compatibility and are not recommended.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "WCF: SOAP with Message Encryption & Windows Authentication",
+        "WCF: SOAP with Transport Encryption & Windows Authentication",
+        "WCF: SOAP with Transport Encryption",
+        "WCF Insecure",
+        ".NET Remoting Secure (legacy)",
+        ".NET Remoting Insecure (legacy)",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Where are your encryption-scheme keys stored? (See System > Security > Encryption Schemes; the summary lists each scheme's method and key location.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Blue Prism database",
+        "Application Server - server config file",
+        "Application Server - separate managed key file",
+        "Don't know\nSection: Logging & Data Management"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What session log levels are set across your Processes and Objects, and are any overridden at the Runtime Resource level? (Levels are set per stage and can be overridden per Runtime Resource.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Mostly Enabled (full)",
+        "Mostly Errors only",
+        "Mostly Disabled",
+        "Mixed across Processes",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Is Unicode session logging enabled? (Off by default; enable only when logging in certain languages. See System > Settings.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Yes",
+        "No",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "What session log archiving method do you use? (See System > Archiving; archiving extracts session logs from the Blue Prism database to files in the archive folder and removes them from the database.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Manual via the Interactive Client",
+        "Automatic via the Interactive Client",
+        "Command line (automatec.exe)",
+        "Housekeeping SQL scripts",
+        "Archiving not configured",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Do you use Data Gateways? (If yes, please state the configured targets under Other.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": true,
+      "choices": [
+        "Yes",
+        "No",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Are your development Interactive Clients and production Runtime Resources “mirrored” - the same build, spec, and configuration (OS level, screen resolution, hardware spec, group policies, etc.)? (If no, please state what differs under Other.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": true,
+      "choices": [
+        "Yes - mirrored",
+        "No - differences exist",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Do you use Login Agent to log in or unlock your Runtime Resources? (Check with your technical architect if unsure.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Yes",
+        "No",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Have you implemented Runtime Resource authentication - do your Runtime Resources start with a /sso or /user switch, or is “Allow anonymous public Runtime Resources” enabled (System > Settings)?",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Yes - /sso switch",
+        "Yes - /user switch",
+        "No - anonymous public Runtime Resources allowed",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Is antivirus enabled on your Runtime Resources, and if so, when do scans run? (Check with your technical architect or platform SME if unsure.)",
+      "required": false,
+      "allowMultipleSelection": false,
+      "allowOtherAnswer": false,
+      "choices": [
+        "Yes - continuous / real-time scans",
+        "Yes - scans only when the Resource is idle",
+        "No antivirus",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "choice",
+      "title": "Do you monitor your Blue Prism environment, and if so, which components are monitored? (Select all that apply. Check with your platform SME if unsure. Please state your monitoring tooling, e.g. SCOM, Zabbix, SolarWinds, Blue Prism-native alerts, under Other.)",
+      "required": false,
+      "allowMultipleSelection": true,
+      "allowOtherAnswer": true,
+      "choices": [
+        "Application Servers",
+        "Runtime Resources",
+        "SQL Server / database",
+        "Schedules & sessions",
+        "Nothing is monitored",
+        "Don't know"
+      ]
+    },
+    {
+      "kind": "question",
+      "type": "text",
+      "title": "Is there anything else about your Blue Prism environment, configuration, or known issues we should be aware of?",
+      "required": false,
+      "multiline": true,
+      "isNumber": false
+    }
+  ]
+}

@@ -4,4 +4,7 @@ __pycache__/
 venv/
 .env
 .pytest_cache/
-outreach_email_cs_directors.md
+drafts/
+# Kept local: the exported flow carries tenant/subscription GUIDs, the internal
+# SharePoint path and staff emails, and this repo is public.
+intake/power_automate_flow.json
