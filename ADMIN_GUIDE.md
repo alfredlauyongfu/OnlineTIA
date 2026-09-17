@@ -88,8 +88,12 @@ see *Troubleshooting* below.
 
 Generated reports land in **`OutputReport`** as a matching pair:
 
-- `TIA_<BookingID>_<timestamp>.md` — the Markdown source.
-- `TIA_<BookingID>_<timestamp>.docx` — the **editable Word copy** the consultant works from.
+- `TIA_<Organisation>_<Environment>_<submission date>_<BookingID>.md` — the Markdown source.
+- `TIA_<Organisation>_<Environment>_<submission date>_<BookingID>.docx` — the **editable
+  Word copy** the consultant works from.
+
+For example `TIA_Credito_Agricola_Production_2026-09-16_E30E0AD5.docx`. Re-processing a
+submission replaces its report rather than adding a second copy.
 
 Reports are **AI-generated drafts**, grounded in the reference material. A Blue Prism
 consultant reviews/edits the `.docx` and sends it to the customer manually — **always
@@ -137,8 +141,12 @@ working on it, so a manual run will not collide with the scheduled one.
 
 ### Match a report to a customer
 
-Reports are named `TIA_<BookingID>_<timestamp>`. The **Booking ID** is shown on the
-customer's form and confirmation email, so match a report to a customer by Booking ID.
+Reports are named
+`TIA_<Organisation>_<Environment>_<submission date>_<BookingID>`, so the customer,
+environment and submission date are readable from the filename alone. The trailing
+**Booking ID** (first 8 characters) is shown on the customer's form and confirmation
+email — use it to match a report to its support booking when two submissions share an
+organisation and date. It is omitted when the customer left the Booking ID blank.
 
 ### Review checklist before sending
 

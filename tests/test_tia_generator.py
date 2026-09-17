@@ -336,17 +336,15 @@ def test_system_prompt_is_non_empty() -> None:
 
 # ---------- _build_output_path ----------
 
-def test_build_output_path_format(tmp_path: Path) -> None:
+def test_build_output_path_uses_the_stem_verbatim(tmp_path: Path) -> None:
+    """run.py's report_prefix already identifies the submission, so no timestamp
+    is appended — a re-run replaces that submission's previous report."""
     gen = _make_gen(tmp_path)
-    out = gen._build_output_path("PREFIX")
-    # Format: {prefix}_{YYYYMMDD_HHMMSS}.md under output_dir
+    out = gen._build_output_path("TIA_Acme_Bank_Production_2026-09-16_E30E0AD5")
     assert out.parent == gen.output_dir
-    assert out.suffix == ".md"
-    assert out.name.startswith("PREFIX_")
-    # Timestamp portion is 15 chars: YYYYMMDD_HHMMSS
-    ts_part = out.stem.split("_", 1)[1]
-    assert len(ts_part) == 15
-    assert ts_part[8] == "_"
+    assert out.name == "TIA_Acme_Bank_Production_2026-09-16_E30E0AD5.md"
+    # Calling twice yields the same path, so the report is replaced not duplicated.
+    assert gen._build_output_path("TIA_Acme") == gen._build_output_path("TIA_Acme")
 
 
 # ---------- _call_rag_chat: HTTP behaviour (mocked) ----------
@@ -595,7 +593,7 @@ def test_generate_writes_partial_report_on_section_failure(tmp_path, monkeypatch
     with pytest.raises(TiaGenerationError):
         gen.generate(src, filename_prefix="TIA_test")
 
-    mds = list((tmp_path / "out").glob("TIA_test_*.md"))
+    mds = list((tmp_path / "out").glob("TIA_test*.md"))
     assert len(mds) == 1                                  # partial .md written
     text = mds[0].read_text(encoding="utf-8")
     assert "INCOMPLETE REPORT" in text                    # flagged
@@ -838,6 +836,28 @@ def test_analysis_directive_three_part_ledger() -> None:
     assert "Red Flag first" in d
     assert "EXHAUSTIVE and FINAL" in d                    # sections can't add rows
     assert "## Criticality Tally" in d                    # counts are copied, not derived
+
+
+def test_uncovered_questions_are_capped_at_suggestion() -> None:
+    """A rating above Suggestion must be traceable to a rubric entry. Where the
+    reference guidance has no entry, the model may only reach Suggestion — stated
+    in the system prompt, at the point of assignment, and enforced by the audit."""
+    assert "Criticality ceiling for uncovered questions" in TIA_SYSTEM_PROMPT
+    assert "never Recommendation, Strong Recommendation or Red Flag" in TIA_SYSTEM_PROMPT
+    # The ceiling lowers a level; it must not delete rubric-backed findings, nor
+    # manufacture findings out of clean answers.
+    assert "The ceiling only LOWERS a level" in TIA_SYSTEM_PROMPT
+    assert "never removes a finding" in TIA_SYSTEM_PROMPT
+    assert "never turns an unproblematic or administrative" in TIA_SYSTEM_PROMPT
+    # Guidance is matched by subject matter — its wording differs from the form's.
+    assert "Match guidance entries by SUBJECT MATTER, not wording" in TIA_SYSTEM_PROMPT
+
+    directive = TiaReportGenerator._analysis_directive()
+    assert "Criticality above Suggestion requires a" in directive
+
+    audit = TiaReportGenerator._verification_directive("draft")
+    assert "Enforce the Suggestion ceiling" in audit
+    assert "downgrade a Criticality above Suggestion to Suggestion" in audit
 
 
 def test_key_findings_hint_carries_criticality() -> None:

@@ -24,10 +24,13 @@ bootstrap instead of surfacing as a KeyError mid-run.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
+import re
 import sys
+import unicodedata
 from pathlib import Path
 
 # Add the sibling source dir to sys.path so the project's modules can be
@@ -72,23 +75,81 @@ REQUIRED_VARS = (
 logger = logging.getLogger(__name__)
 
 
-def report_prefix(source: Path) -> str:
-    """Filename prefix for the TIA report generated from `source`.
+# Report-name sizing: enough of the organisation to recognise it, and enough
+# Booking ID to tell two submissions apart without pasting a whole GUID.
+ORGANISATION_MAX_CHARS = 40
+BOOKING_ID_CHARS = 8
 
-    JSON form exports are named from their "Booking ID" answer
-    (`TIA_<bookingid>`); anything else — Excel inputs, a missing/non-string
-    field, an unreadable file — falls back to the sanitized file stem.
+
+def _answer(payload: dict, key: str) -> str:
+    """Read one field's answer from a form export, accepting the nested
+    `{"question", "answer"}` shape as well as a plain metadata value."""
+    value = payload.get(key)
+    if isinstance(value, dict):
+        value = value.get("answer")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _slug(text: str, limit: int) -> str:
+    """Filename-safe slug, trimmed to `limit` on a word boundary.
+
+    Accents are transliterated FIRST: `safe_name` alone would turn
+    "Crédito Agrícola" into "Cr_dito_Agr_cola", mangling a customer's name.
+    """
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    slug = ExcelToJsonConverter.safe_name(ascii_text) if ascii_text.strip() else ""
+    if slug == "sheet" and not ascii_text.strip():
+        return ""                      # safe_name's placeholder for empty input
+    if len(slug) <= limit:
+        return slug
+    cut = slug[:limit]
+    return (cut.rsplit("_", 1)[0] if "_" in cut else cut).strip("_-")
+
+
+def _organisation_slug(raw: str) -> str:
+    """Organisations commonly answer "Company - Department - Team"; the company
+    alone is what makes a filename recognisable, so keep the leading segment."""
+    head = re.split(r"\s+-\s+", raw, maxsplit=1)[0] if raw else ""
+    return _slug(head or raw, ORGANISATION_MAX_CHARS)
+
+
+def _submission_date(raw: str) -> str:
+    """The submission date as YYYY-MM-DD. Falls back to today when the field is
+    absent or unparseable, so naming never fails."""
+    try:
+        return dt.datetime.fromisoformat(raw.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except (ValueError, AttributeError):
+        return dt.datetime.now().strftime("%Y-%m-%d")
+
+
+def report_prefix(source: Path) -> str:
+    """Filename stem for the TIA report generated from `source`.
+
+    JSON form exports are named
+    `TIA_<Organisation>_<Environment>_<submission date>_<Booking ID>` — readable,
+    sorts by customer, and keeps the Booking ID that links a report back to its
+    support booking. Empty segments are dropped rather than left as dangling
+    separators. Anything else — an Excel input, a response with no Organisation,
+    an unreadable file — falls back to the sanitized file stem.
+
+    No timestamp is appended, so re-running a submission replaces its previous
+    report instead of accumulating near-duplicates.
     Never raises: report naming must not be able to fail the run.
     """
     if source.suffix.lower() == ".json":
         try:
             with source.open("r", encoding="utf-8-sig") as f:
-                booking_id = json.load(f).get("Booking ID")
-            # Form exports nest each field as {"question": ..., "answer": ...}.
-            if isinstance(booking_id, dict):
-                booking_id = booking_id.get("answer")
-            if isinstance(booking_id, str) and booking_id.strip():
-                return f"TIA_{ExcelToJsonConverter.safe_name(booking_id.strip())}"
+                payload = json.load(f)
+            organisation = _organisation_slug(_answer(payload, "Organisation"))
+            if organisation:
+                parts = [
+                    organisation,
+                    _slug(_answer(payload, "Environment"), 20),
+                    _submission_date(_answer(payload, "Submission time")),
+                    _slug(_answer(payload, "Booking ID")[:BOOKING_ID_CHARS],
+                          BOOKING_ID_CHARS),
+                ]
+                return "TIA_" + "_".join(p for p in parts if p)
         except Exception:
             pass  # fall through to the stem rule
     # The flow names submissions "TIA_<booking id>- <timestamp>.json", so a blank

@@ -247,7 +247,7 @@ Every variable listed below is required in `.env` (the entry point's
 | `INTERMEDIATE_JSON_DIR` | Per-sheet JSON output from customer conversion. Wiped before each customer file is processed. | `run.py`, `tia_generator.py` |
 | `PROCESSING_DIR` | In-flight customer input file (claimed but not yet graduated). | `run.py` |
 | `PROCESSED_DIR` | Customer input files graduate here after successful processing. | `run.py` |
-| `OUTPUT_REPORT_DIR` | Generated `TIA_<stem>_<timestamp>.md` reports. | `run.py`, `tia_generator.py` |
+| `OUTPUT_REPORT_DIR` | Generated `TIA_<Organisation>_<Environment>_<submission date>_<Booking ID>.md` reports. | `run.py`, `tia_generator.py` |
 | `REFERENCE_TO_BE_LOADED_DIR` | Heterogeneous inbox: xlsx/xlsm reference workbooks AND passthrough files (e.g. *.pdf). Each file type is picked up by its own stage. | `reference_info_extractor.py`, `reference_passthrough_ingester.py` |
 | `REFERENCE_LOADED_DIR` | Successfully-ingested reference materials of **all types** graduate here. Holds the source xlsx (from stage 1) and the PDFs (from stage 1.5). Stage 2 scans this dir for passthrough files when building the sync-gate local set. | `reference_info_extractor.py`, `reference_passthrough_ingester.py`, `run.py` |
 | `REFERENCE_JSON_DIR` | Holds both kinds of Excel-derived artifacts: source per-sheet JSON (`<workbook>__<sheet>.json`, wiped before each reference convert) and the LLM-distilled per-sheet extractions (`extracted_<sheet>_<ts>.json`, selectively wiped before each extract). The `extracted_*.json` files are the source for RAG ingest. | `reference_info_extractor.py`, `reference_sheet_extractor.py`, `run.py`, `rag_ingester.py` |
@@ -394,7 +394,8 @@ workbook**. The next `run.py` will, **for each input file**:
    analysis's Assessment Ledger (one block per row), so every question
    appears exactly once. The sections are concatenated into one Markdown
    document written to `OUTPUT_REPORT_DIR` as
-   `TIA_<source_stem>_<YYYYMMDD_HHMMSS>.md` (~5 RAG calls total: analysis,
+   `TIA_<Organisation>_<Environment>_<submission date>_<Booking ID>.md`
+   (~5 RAG calls total: analysis,
    verification, and the three narrative sections). A
    **Microsoft Word copy** (`.docx`) is then written alongside it from the
    same content — independently and best-effort. It is rendered into the
@@ -450,11 +451,15 @@ right setting.
 ## Outputs
 
 - **TIA reports**: each customer input yields a matching pair in
-  `OUTPUT_REPORT_DIR` — `TIA_<name>_<YYYYMMDD_HHMMSS>.md` (Markdown,
-  authoritative) and the same-stem `.docx` (Microsoft Word, generated
-  independently and best-effort). `<name>` is the JSON form export's
-  `Booking ID` when present, otherwise the source file's stem — either
-  way per-file reports don't collide.
+  `OUTPUT_REPORT_DIR` — `TIA_<Organisation>_<Environment>_<submission
+  date>_<Booking ID>.md` (Markdown, authoritative) and the same-stem
+  `.docx` (Microsoft Word, generated independently and best-effort), e.g.
+  `TIA_Credito_Agricola_Production_2026-09-16_E30E0AD5.md`. Accents are
+  transliterated, only the leading segment of the Organisation is used
+  (customers often answer "Company - Department - Team"), and an absent
+  segment is dropped. A response with no Organisation, or an Excel input,
+  falls back to the source file's stem. The name carries no run timestamp,
+  so re-running a submission **replaces** its previous report.
 - **Logs**: `LOG_DIR\logs.txt` — timestamped, captures every stage
   banner, every LLM call (start / OK / FAILED), every RAG operation,
   every passthrough upload, and the wipe events. Auto-rotates at 10 MB
@@ -496,7 +501,7 @@ From the project root, using the venv-Python:
 & .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected output ends with `225 passed` (in a few seconds) and exit code 0. If you
+Expected output ends with `230 passed` (in a few seconds) and exit code 0. If you
 see a failure, the line immediately above the summary identifies the
 file and test name.
 

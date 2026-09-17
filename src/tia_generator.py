@@ -91,6 +91,21 @@ a criticality.
 - If the guidance does not cover a question, assess it only from the retrieved
   reference chunks or the customer's own statements — never from general
   knowledge alone. With no such basis, leave the row unflagged.
+- Criticality ceiling for uncovered questions: when the guidance has no entry
+  for a question, a row that still warrants action is ALWAYS "Suggestion" —
+  never Recommendation, Strong Recommendation or Red Flag, however serious it
+  looks. Only a rating the guidance itself assigns may exceed Suggestion. This
+  keeps every level above Suggestion traceable to the reference material.
+- Match guidance entries by SUBJECT MATTER, not wording. The guidance phrases
+  questions differently from the form — "What is the physical location of the
+  Runtime Resources?" covers "What infrastructure hosts your Runtime
+  Resources?", and "Are the connections between the Application Server(s) and
+  the Database secured?" covers whether that connection is encrypted. An entry
+  whose answer options fit the customer's answer IS an entry for that question,
+  and its rating applies in full.
+- The ceiling only LOWERS a level. It never removes a finding, never turns a
+  flagged row into "—", and never turns an unproblematic or administrative
+  answer into a finding. A row needing no action stays unflagged (—).
 
 Style (strict): be concise. Short sentences. No consultant filler, no preamble, no
 closing summaries, and never restate a question in prose. Never explain the same
@@ -943,7 +958,10 @@ class TiaReportGenerator:
             "Security: Runtime Resource authentication and "
             "antivirus/endpoint protection. Every one of the seven categories has "
             "at least one question above, so none should come out empty, and none "
-            "is a catch-all for leftovers. Criticality is exactly one of the four "
+            "is a catch-all for leftovers. Criticality above Suggestion requires a "
+            "REFERENCE SCORING GUIDANCE entry for that question: where the guidance "
+            "has no entry, a row that warrants action is Suggestion and nothing "
+            "higher (a row warranting none stays —). Criticality is exactly one of the four "
             "assessment categories from the system prompt for rows needing action, "
             "or the single character — for rows needing none. Subject is the "
             "customer's data key copied CHARACTER-FOR-CHARACTER — never reworded, "
@@ -1015,6 +1033,13 @@ class TiaReportGenerator:
             "wording from the matched guidance item (blank if none).\n"
             "- Do NOT invent new rows or change the criticality of grounded rows "
             "that match the guidance.\n"
+            "- Enforce the Suggestion ceiling: for any row whose question the "
+            "guidance does NOT cover, downgrade a Criticality above Suggestion to "
+            "Suggestion (leave rows already at Suggestion or — unchanged). Match "
+            "guidance entries by subject matter, not wording — a differently "
+            "phrased entry whose options fit the answer DOES cover the question, "
+            "so keep its rating as-is. Downgrading is the only change permitted "
+            "here: never unflag a row and never delete one.\n"
             "- Re-check every figure in Environment Facts against the customer "
             "answers.\n"
             "- Re-count the Criticality Tally from the corrected ledger.\n\n"
@@ -1276,5 +1301,9 @@ class TiaReportGenerator:
         return fr if isinstance(fr, str) else None
 
     def _build_output_path(self, prefix: str) -> Path:
-        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        return self.output_dir / f"{prefix}_{ts}.md"
+        """The report path. `prefix` is the complete stem from run.py's
+        `report_prefix()`, which already identifies the submission (organisation,
+        environment, submission date, Booking ID) — so no timestamp is appended
+        and re-running a submission replaces its previous report rather than
+        leaving near-duplicates to pick between."""
+        return self.output_dir / f"{prefix}.md"
