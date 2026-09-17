@@ -92,7 +92,7 @@ Generated reports land in **`OutputReport`** as a matching pair:
 - `TIA_<Organisation>_<Environment>_<submission date>_<BookingID>.docx` — the **editable
   Word copy** the consultant works from.
 
-For example `TIA_Credito_Agricola_Production_2026-09-16_E30E0AD5.docx`. Re-processing a
+For example `TIA_Acme_Bank_Production_2026-09-16_BK123456.docx`. Re-processing a
 submission replaces its report rather than adding a second copy.
 
 Reports are **AI-generated drafts**, grounded in the reference material. A Blue Prism

@@ -340,9 +340,9 @@ def test_build_output_path_uses_the_stem_verbatim(tmp_path: Path) -> None:
     """run.py's report_prefix already identifies the submission, so no timestamp
     is appended — a re-run replaces that submission's previous report."""
     gen = _make_gen(tmp_path)
-    out = gen._build_output_path("TIA_Acme_Bank_Production_2026-09-16_E30E0AD5")
+    out = gen._build_output_path("TIA_Acme_Bank_Production_2026-09-16_BK123456")
     assert out.parent == gen.output_dir
-    assert out.name == "TIA_Acme_Bank_Production_2026-09-16_E30E0AD5.md"
+    assert out.name == "TIA_Acme_Bank_Production_2026-09-16_BK123456.md"
     # Calling twice yields the same path, so the report is replaced not duplicated.
     assert gen._build_output_path("TIA_Acme") == gen._build_output_path("TIA_Acme")
 

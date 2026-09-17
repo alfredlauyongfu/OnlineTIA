@@ -23,7 +23,7 @@ def _field(question: str, answer) -> dict:
 
 
 def _submission(org="Acme Bank", env="Production",
-                submitted="2026-09-16T16:15:27Z", booking="E30E0AD5-F9BA-456C"):
+                submitted="2026-09-16T16:15:27Z", booking="BK123456-0000-0000"):
     """A form export carrying the four fields the report name is built from."""
     payload = {"Submission time": submitted}
     for key, answer in (("Organisation", org), ("Environment", env),
@@ -35,24 +35,24 @@ def _submission(org="Acme Bank", env="Production",
 
 def test_report_prefix_is_org_env_date_and_booking(tmp_path: Path) -> None:
     """The readable name: who, which environment, when, and the booking link."""
-    src = _write_json(tmp_path, "TIA_E30E0AD5- 20260916_161532.json", _submission())
-    assert run.report_prefix(src) == "TIA_Acme_Bank_Production_2026-09-16_E30E0AD5"
+    src = _write_json(tmp_path, "TIA_BK123456- 20260916_161532.json", _submission())
+    assert run.report_prefix(src) == "TIA_Acme_Bank_Production_2026-09-16_BK123456"
 
 
 def test_report_prefix_transliterates_accents(tmp_path: Path) -> None:
     """A customer's name must stay recognisable: plain sanitising would turn
-    "Crédito Agrícola" into "Cr_dito_Agr_cola"."""
-    src = _write_json(tmp_path, "r.json", _submission(org="Crédito Agrícola"))
-    assert run.report_prefix(src).startswith("TIA_Credito_Agricola_Production_")
+    "Acmé Soluções" into "Acm__Solu__es"."""
+    src = _write_json(tmp_path, "r.json", _submission(org="Acmé Soluções"))
+    assert run.report_prefix(src).startswith("TIA_Acme_Solucoes_Production_")
 
 
 def test_report_prefix_keeps_only_the_leading_organisation_segment(tmp_path: Path) -> None:
     """Customers often answer "Company - Department - Team"; the company alone
     is what makes the filename recognisable."""
     src = _write_json(tmp_path, "r.json", _submission(
-        org="Crédito Agrícola - Direção de Agilidade e Transformação - Produtividade"))
+        org="Acmé Soluções - Direção de Agilidade e Transformação - Produtividade"))
     assert run.report_prefix(src) == (
-        "TIA_Credito_Agricola_Production_2026-09-16_E30E0AD5")
+        "TIA_Acme_Solucoes_Production_2026-09-16_BK123456")
 
 
 def test_report_prefix_caps_a_very_long_organisation(tmp_path: Path) -> None:
@@ -71,7 +71,7 @@ def test_report_prefix_falls_back_to_run_date_on_bad_submission_time(tmp_path: P
     import datetime as dt
     src = _write_json(tmp_path, "r.json", _submission(submitted="not a date"))
     today = dt.datetime.now().strftime("%Y-%m-%d")
-    assert run.report_prefix(src) == f"TIA_Acme_Bank_Production_{today}_E30E0AD5"
+    assert run.report_prefix(src) == f"TIA_Acme_Bank_Production_{today}_BK123456"
 
 
 def test_report_prefix_without_organisation_falls_back_to_stem(tmp_path: Path) -> None:

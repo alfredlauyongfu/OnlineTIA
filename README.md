@@ -454,7 +454,7 @@ right setting.
   `OUTPUT_REPORT_DIR` — `TIA_<Organisation>_<Environment>_<submission
   date>_<Booking ID>.md` (Markdown, authoritative) and the same-stem
   `.docx` (Microsoft Word, generated independently and best-effort), e.g.
-  `TIA_Credito_Agricola_Production_2026-09-16_E30E0AD5.md`. Accents are
+  `TIA_Acme_Bank_Production_2026-09-16_BK123456.md`. Accents are
   transliterated, only the leading segment of the Organisation is used
   (customers often answer "Company - Department - Team"), and an absent
   segment is dropped. A response with no Organisation, or an Excel input,

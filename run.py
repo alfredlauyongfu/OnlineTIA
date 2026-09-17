@@ -94,7 +94,7 @@ def _slug(text: str, limit: int) -> str:
     """Filename-safe slug, trimmed to `limit` on a word boundary.
 
     Accents are transliterated FIRST: `safe_name` alone would turn
-    "Crédito Agrícola" into "Cr_dito_Agr_cola", mangling a customer's name.
+    "Acmé Soluções" into "Acm__Solu__es", mangling a customer's own name.
     """
     ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
     slug = ExcelToJsonConverter.safe_name(ascii_text) if ascii_text.strip() else ""
