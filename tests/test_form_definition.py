@@ -27,8 +27,9 @@ FLOW_PATH = INTAKE_DIR / "power_automate_flow.json"
 EXPECTED_QUESTIONS = 35
 EXPECTED_SECTIONS = 4
 
-# Fields the pipeline reads out of a submitted response. "Booking ID" names the
-# report (`TIA_<Booking ID>_<ts>`) and "Organisation" fills the .docx cover —
+# Fields the pipeline reads out of a submitted response. Both name the report
+# (`TIA_<Organisation>_<Environment>_<date>_<Booking ID>`); "Organisation" also
+# fills the .docx cover —
 # see tia_generator._extract_cover_meta. Matched loosely on question title
 # because the Power Automate flow, not the form, defines the export key names.
 # ("Submission time" is Forms-generated metadata, not a question, so it is not

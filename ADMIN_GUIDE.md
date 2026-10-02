@@ -132,8 +132,8 @@ in **Windows Task Scheduler**.
 To process an urgent submission immediately, or to re-process after fixing an issue, run
 the agent by hand from `C:\blueprism\OnlineTIA`:
 
-```powershell
-& .\.venv\Scripts\python.exe run.py
+```cmd
+.venv\Scripts\python.exe run.py
 ```
 
 This is safe to run at any time: the agent claims each file into `Processing` before
@@ -156,8 +156,14 @@ organisation and date. It is omitted when the customer left the Booking ID blank
 - **Criticality ratings are graded against the reference scoring rubric** — a finding's
   level (Red Flag / Strong Recommendation / Recommendation / Suggestion) comes from the
   reference material, not guesswork.
-- **The narrative wording is AI-generated** — the Key Findings summary and each
-  recommendation's phrasing should be sanity-checked for tone and accuracy.
+- **The narrative wording is AI-generated** — the Summary and each recommendation's
+  phrasing should be sanity-checked for tone and accuracy. Key Findings is assembled in
+  code from the same findings as the count table, so it cannot name an item the detail
+  does not carry.
+- **Answers are shown exactly as the customer wrote them** — including in a language other
+  than English, with an English rendering beneath. Questions answered "Don't know" are
+  marked **Not assessed** rather than rated, and the Summary opens with how much of the
+  questionnaire could actually be assessed.
 - **Check the Outstanding Questions section** for anything the customer genuinely left
   blank that may warrant a follow-up before or alongside the report.
 

@@ -51,7 +51,7 @@ flowchart TD
         IN["INPUT_DIR<br/>customer *.json / *.xlsx / *.xlsm"]
         IN -->|"one file at a time"| S3["Stage 3 — stage as JSON<br/>(wipe INTERMEDIATE first)"]
         S3 --> S4["Stage 4 — generate TIA<br/>canonical analysis → verification → 4 sections"]
-        S4 -->|"TIA_&lt;stem&gt;_&lt;ts&gt;"| OUT["OUTPUT_REPORT_DIR<br/>.md + .docx"]
+        S4 -->|"TIA_&lt;Organisation&gt;_&lt;Environment&gt;_&lt;date&gt;_&lt;Booking ID&gt;"| OUT["OUTPUT_REPORT_DIR<br/>.md + .docx"]
         S3 -.->|"INPUT → PROCESSING → PROCESSED<br/>(only if TIA succeeded)"| PROC["PROCESSED_DIR"]
     end
 
@@ -93,8 +93,8 @@ both share the same PROCESSING/PROCESSED lifecycle and per-file isolation:
 
 | Extension | Handling | Report name |
 |-----------|----------|-------------|
-| `.json` | **Form export** from the online TIA form, written by the Power Automate flow. Each answered field is `{"question": <exact form wording>, "answer": <response>}`; plain values (e.g. `"Submission time"`) are submission metadata and get no assessment row. Validated (must parse as a JSON object; UTF-8 BOM tolerated) and staged as-is into `INTERMEDIATE_JSON_DIR`. | `TIA_<Booking ID>_<ts>.md` — falls back to the file stem if the `"Booking ID"` field is absent. |
-| `.xlsx`, `.xlsm` | **Workbook**: converted to one JSON per sheet (`{stem}__{sheet}.json`), reference-scaffolding sheets excluded downstream. | `TIA_<file stem>_<ts>.md` |
+| `.json` | **Form export** from the online TIA form, written by the Power Automate flow. Each answered field is `{"question": <exact form wording>, "answer": <response>}`; plain values (e.g. `"Submission time"`) are submission metadata and get no assessment row. Validated (must parse as a JSON object; UTF-8 BOM tolerated) and staged as-is into `INTERMEDIATE_JSON_DIR`. | `TIA_<Organisation>_<Environment>_<submission date>_<Booking ID>.md` — each absent segment is dropped; no Organisation falls back to the file stem. |
+| `.xlsx`, `.xlsm` | **Workbook**: converted to one JSON per sheet (`{stem}__{sheet}.json`), reference-scaffolding sheets excluded downstream. | `TIA_<file stem>.md` |
 
 The accepted patterns are `CUSTOMER_INPUT_PATTERNS` in `src/excel_to_json.py`.
 
@@ -106,12 +106,12 @@ only Python file at the project root.
 | File | What it does |
 |------|-------------|
 | `run.py` | CLI entry point. Runs all four stages in the order above. |
-| `src/reference_info_extractor.py` | Stage 1 orchestrator: reference Excel → JSON → LLM-extracted JSON. |
+| `src/reference_info_extractor.py` | Stage 1 orchestrator: reference Excel → JSON → LLM-extracted JSON. Retires superseded workbook versions into `REFERENCE_LOADED_DIR\Superseded\`. |
 | `src/reference_passthrough_ingester.py` | Stage 1.5 orchestrator: glob non-Excel patterns in the inbox → direct RAG upload (overwrite-aware) → move to LOADED. |
 | `src/excel_to_json.py` | `ExcelToJsonConverter` — Excel→JSON conversion + claim/processed move lifecycle. |
 | `src/reference_sheet_extractor.py` | `ReferenceSheetExtractor` — per-sheet LLM extraction via `/v1/chat/completions`. |
 | `src/rag_ingester.py` | `RagIngester` — list/register/upload/delete against `/rag/ingest/*`, with basename-equality sync gate (now supports `extra_files` for cross-dir local sets). |
-| `src/tia_generator.py` | `TiaReportGenerator` — generates the Markdown TIA via `/rag/chat/completions`, **one section at a time** (scopes RAG retrieval per topic and bounds each call's output), then concatenates. Warns if the gateway's `finish_reason` signals a truncated section. |
+| `src/tia_generator.py` | `TiaReportGenerator` — generates the Markdown TIA via `/rag/chat/completions`, **one section at a time** (scopes RAG retrieval per topic and bounds each call's output), then concatenates. Key Findings and the Detailed Assessment blocks are rendered in code from the analysis ledger, not asked for. Warns if the gateway's `finish_reason` signals a truncated section. |
 | `src/docx_writer.py` | `write_docx` — renders the report into the branded Word template (`assets/tia_template.docx`): fills the cover with the customer's Organisation and assessment date, maps the Markdown to native Word styles. Falls back to a blank document if the template is missing. |
 | `src/logging_setup.py` | `configure_logging` + `bootstrap` (.env load + required-var check + logging). |
 | `src/http_resilient.py` | `call_resilient` — hard wall-clock cap + bounded retry around each gateway call so a stall can't hang the run. |
@@ -135,21 +135,23 @@ No system-level dependencies (no SQL, no Docker, no compilation).
 
 ## Deployment / setup on a new Windows machine
 
-PowerShell commands shown; bash/zsh equivalent should be obvious.
+First-time setup. To refresh a machine that already runs the pipeline, see
+[Updating to the latest version](#updating-to-the-latest-version-from-github)
+instead. Commands are `cmd.exe`.
 
-### 1. Clone / unzip the project somewhere
+### 1. Clone the project
 
-```powershell
-cd C:\blueprism
-git clone <repo url> OnlineTIA
+```cmd
+cd /d C:\blueprism
+git clone https://github.com/alfredlauyongfu/OnlineTIA.git OnlineTIA
 cd OnlineTIA
 ```
 
-(Or copy the project tree manually — there's no build artifact to fetch.)
+(Or copy the project tree manually — there's no build artifact to fetch. A
+tree copied rather than cloned has no `.git`, so it can only be updated by
+copying again.)
 
 ### 2. Create and activate a virtual environment
-
-Using the Windows Command Prompt (`cmd.exe`):
 
 ```cmd
 python -m venv .venv
@@ -158,9 +160,9 @@ python -m venv .venv
 
 ### 3. Install Python dependencies
 
-```powershell
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```cmd
+.venv\Scripts\python.exe -m pip install --upgrade pip
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 This installs five packages: `openpyxl`, `python-dotenv`, `requests`,
@@ -173,22 +175,13 @@ The pipeline expects nine directories to exist (it auto-creates output
 subdirs when missing, but pre-creating everything avoids first-run noise).
 Default layout:
 
-```powershell
-$base = "C:\blueprism\OnlineTIAWorkingDir"
-$dirs = @(
-    "InputCustomerResponse",
-    "IntermediateCustomerResponseJson",
-    "Processing", "Processed",
-    "OutputReport",
-    "ReferenceToBeLoaded", "ReferenceLoaded",
-    "ReferenceJson",
-    "Logs"
-)
-foreach ($d in $dirs) { New-Item -ItemType Directory -Force "$base\$d" | Out-Null }
+```cmd
+mkdir C:\blueprism\OnlineTIAWorkingDir
+cd /d C:\blueprism\OnlineTIAWorkingDir
+mkdir InputCustomerResponse IntermediateCustomerResponseJson Processing Processed OutputReport ReferenceToBeLoaded ReferenceLoaded ReferenceJson Logs
 ```
 
-Change `$base` if you want a different root — make sure the `.env` paths
-match.
+Change the root if you want it elsewhere — make sure the `.env` paths match.
 
 If the working-dir root is a **OneDrive-synced folder** (the production
 layout — see [ADMIN_GUIDE.md](ADMIN_GUIDE.md)), right-click it in File
@@ -198,8 +191,8 @@ files under a service account.
 
 ### 5. Configure `.env`
 
-```powershell
-Copy-Item .env.example .env
+```cmd
+copy .env.example .env
 ```
 
 Then open `.env` and:
@@ -227,12 +220,93 @@ already in the RAG store at the gateway.
 
 ### 7. Run
 
-```powershell
-& .\.venv\Scripts\python.exe run.py
+```cmd
+.venv\Scripts\python.exe run.py
 ```
 
 Expected: `=== run.py start ===` banner, four stage banners, exit 0. See
 `Logs\logs.txt` for the full trace.
+
+## Updating to the latest version from GitHub
+
+For a machine already running the pipeline. Nothing in the working-dir tree
+(`OnlineTIAWorkingDir`) is touched — code and working data are separate.
+
+### 1. Stop the schedule
+
+In **Task Scheduler**, select the OnlineTIA task → **End** any running
+instance, then **Disable** it. An update landing mid-run would swap modules
+under a live process.
+
+### 2. See what is local before pulling
+
+```cmd
+cd /d C:\blueprism\OnlineTIA
+git status
+```
+
+`.env`, `.venv\`, `drafts\` and `intake\power_automate_flow.json` are
+gitignored and never appear here. Anything else listed as modified is a local
+edit to a tracked file and will block the merge — copy it aside, then
+`git checkout -- <path>` to discard it.
+
+If the branch line reports anything other than `main`, switch first:
+
+```cmd
+git checkout main
+```
+
+### 3. Pull
+
+```cmd
+git pull origin main
+```
+
+### 4. Reinstall dependencies
+
+Cheap and idempotent when nothing changed; skipping it after a release that
+added a package produces an import error on the next run.
+
+```cmd
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+### 5. Reconcile `.env` with the template
+
+```cmd
+git diff HEAD@{1} HEAD -- .env.example
+```
+
+Empty output means no action. Any variable added to the template must be
+added to your `.env` by hand — `bootstrap()` exits with code 2 when a
+required one is missing, before any work is done.
+
+### 6. Verify, then re-enable
+
+```cmd
+.venv\Scripts\python.exe -m pytest -q
+.venv\Scripts\python.exe run.py
+```
+
+Expect `283 passed` and an exit-0 run — a no-op finishing in milliseconds if
+both inboxes are empty. Re-enable the scheduled task.
+
+### Rolling back
+
+```cmd
+git log --oneline -5
+git checkout <previous commit sha>
+```
+
+Then repeat steps 4–6. `git checkout main` returns to the tip.
+
+### If the tree was copied rather than cloned
+
+There is no `.git` to pull into. Download the ZIP from the repository's
+**Code → Download ZIP**, unpack it elsewhere, then copy its contents over
+`C:\blueprism\OnlineTIA` **excluding** `.env` — it is not in the ZIP, and
+overwriting the folder wholesale would delete it. `.venv\` is likewise absent
+from the ZIP and survives a copy-over; run steps 4–6 afterwards.
 
 ## Configuration reference
 
@@ -249,7 +323,7 @@ Every variable listed below is required in `.env` (the entry point's
 | `PROCESSED_DIR` | Customer input files graduate here after successful processing. | `run.py` |
 | `OUTPUT_REPORT_DIR` | Generated `TIA_<Organisation>_<Environment>_<submission date>_<Booking ID>.md` reports. | `run.py`, `tia_generator.py` |
 | `REFERENCE_TO_BE_LOADED_DIR` | Heterogeneous inbox: xlsx/xlsm reference workbooks AND passthrough files (e.g. *.pdf). Each file type is picked up by its own stage. | `reference_info_extractor.py`, `reference_passthrough_ingester.py` |
-| `REFERENCE_LOADED_DIR` | Successfully-ingested reference materials of **all types** graduate here. Holds the source xlsx (from stage 1) and the PDFs (from stage 1.5). Stage 2 scans this dir for passthrough files when building the sync-gate local set. | `reference_info_extractor.py`, `reference_passthrough_ingester.py`, `run.py` |
+| `REFERENCE_LOADED_DIR` | Successfully-ingested reference materials of **all types** graduate here. Holds the source xlsx (from stage 1) and the PDFs (from stage 1.5). Stage 2 scans this dir for passthrough files when building the sync-gate local set. Superseded workbook versions are moved into a `Superseded\` subfolder, which the non-recursive scan ignores. | `reference_info_extractor.py`, `reference_passthrough_ingester.py`, `run.py` |
 | `REFERENCE_JSON_DIR` | Holds both kinds of Excel-derived artifacts: source per-sheet JSON (`<workbook>__<sheet>.json`, wiped before each reference convert) and the LLM-distilled per-sheet extractions (`extracted_<sheet>_<ts>.json`, selectively wiped before each extract). The `extracted_*.json` files are the source for RAG ingest. | `reference_info_extractor.py`, `reference_sheet_extractor.py`, `run.py`, `rag_ingester.py` |
 | `LOG_DIR` | Holds `logs.txt` (append-mode across runs). | all entry points |
 
@@ -336,7 +410,12 @@ guidance, recommended configurations, severity rubrics). The pipeline:
    writing `extracted_<sheet>_<YYYYMMDD_HHMMSS>.json` back into
    `REFERENCE_JSON_DIR` alongside the source per-sheet JSONs.
 3. **Moves** the source workbook to `REFERENCE_LOADED_DIR` so it isn't
-   re-processed on the next run.
+   re-processed on the next run, and **retires** any older version of the
+   same workbook found there into `REFERENCE_LOADED_DIR\Superseded\`
+   (`V2.6.4` retired by `V2.6.5` — the trailing version token is what
+   identifies the family). Retired files are moved, never deleted, and the
+   subfolder is invisible to the stage-2 scan, which globs
+   `REFERENCE_LOADED_DIR` non-recursively.
 
 **1b. Passthrough files (currently `.pdf`)** — for documents that should
 go straight to RAG without client-side parsing (installation manuals,
@@ -357,6 +436,14 @@ local set: every `extracted_*.json` in `REFERENCE_JSON_DIR` plus every
 passthrough file in `REFERENCE_LOADED_DIR`. If the basename set already
 matches RAG, it skips entirely (idempotent re-run). Otherwise the stale
 RAG entries are deleted and the fresh ones uploaded.
+
+**If stage 1 failed**, the sync is skipped and the run exits non-zero — a
+failed extraction (rate limit, spend cap, malformed response) leaves a
+partial rubric on disk, and syncing it would delete the complete rubric in
+RAG and replace it with the fragment. Every later report would then be
+graded against a rubric missing whole topics with nothing to show it. RAG is
+left as it is and the next run retries the extraction; the log line is
+`RAG sync SKIPPED`.
 
 #### 2. Customer report generation — triggered by files in `INPUT_DIR`
 
@@ -380,23 +467,32 @@ workbook**. The next `run.py` will, **for each input file**:
    block's heading is the **exact question the customer was asked**, taken
    in code from the form export's own `question` field (matched to the
    ledger row by its data key) rather than from the model's transcription
-   of it. Then the report's **four sections** — **Summary** (intro +
-   criticality count table), **Key Findings** (the most significant items),
-   **Detailed Assessment** (one Q&A subsection per category: General
-   Information, SQL Server, Application Server(s), Interactive Clients,
-   Runtime Resources (Robots), Disaster Recovery, Security — every
-   questionnaire answer as a numbered block), and **Outstanding Questions**
-   — are each generated by a separate `/rag/chat/completions` call
-   **anchored to that shared analysis**, combining the customer's JSON
-   data, the canonical analysis, and the most relevant reference chunks
-   retrieved from the RAG database. The **Detailed Assessment blocks are
-   not an LLM call at all** — they are rendered in code directly from the
-   analysis's Assessment Ledger (one block per row), so every question
-   appears exactly once. The sections are concatenated into one Markdown
-   document written to `OUTPUT_REPORT_DIR` as
+   of it. Then the report's **four sections** are assembled:
+
+   | Section | Produced by | Content |
+   |---|---|---|
+   | Summary | `/rag/chat/completions` | Intro, answer-coverage line, criticality count table |
+   | Key Findings | **code** | The flagged ledger rows, most severe first, capped at 12 |
+   | Detailed Assessment | **code** | One Q&A block per ledger row, grouped by category: General Information, SQL Server, Application Server(s), Interactive Clients, Runtime Resources (Robots), Disaster Recovery, Security |
+   | Outstanding Questions | `/rag/chat/completions` | Every question answered blank or "Don't know", grouped by category |
+
+   The two LLM sections are **anchored to the shared analysis**, combining
+   the customer's JSON data, the canonical analysis, and the most relevant
+   reference chunks retrieved from RAG. The two code-rendered sections are
+   derived from the analysis's Assessment Ledger, so every question appears
+   exactly once and Key Findings cannot contradict the count table — as an
+   LLM call it repeatedly did, inventing severities to meet a minimum count
+   and listing rows the ledger had left unflagged. Each block prints the
+   customer's answer **verbatim from the submission**, not the ledger's copy
+   of it, which had been quietly abbreviating job titles and translating
+   non-English answers; where the model's rendering genuinely differs in
+   wording it is shown beneath as `Translation:`. A row whose answer is
+   "Don't know" is labelled **Not assessed** rather than given a severity,
+   and gets its own row in the count table. The sections are concatenated
+   into one Markdown document written to `OUTPUT_REPORT_DIR` as
    `TIA_<Organisation>_<Environment>_<submission date>_<Booking ID>.md`
-   (~5 RAG calls total: analysis,
-   verification, and the three narrative sections). A
+   (4 gateway calls total: analysis, verification, Summary, Outstanding
+   Questions). A
    **Microsoft Word copy** (`.docx`) is then written alongside it from the
    same content — independently and best-effort. It is rendered into the
    SS&C / Blue Prism house-style template (`assets/tia_template.docx`:
@@ -407,17 +503,19 @@ workbook**. The next `run.py` will, **for each input file**:
    missing it falls back to a blank document, and if Word generation fails the
    `.md` is unaffected and the run still succeeds.
 
-   > **Why section by section?** Generating each section as its own call
-   > scopes the RAG retrieval to that section's topic and keeps each
-   > call's output bounded. The upfront canonical-analysis pass keeps the
-   > independently-generated sections consistent (same criticalities). The
-   > Summary count table is then **recomputed in code** from the
+   > **Why section by section?** Generating each narrative section as its
+   > own call scopes the RAG retrieval to that section's topic and keeps
+   > each call's output bounded. The upfront canonical-analysis pass keeps
+   > the independently-generated sections consistent (same criticalities).
+   > The Summary count table is **recomputed in code** from the
    > criticalities actually rendered in the Detailed Assessment blocks, so
-   > it can never disagree with the detail (LLM tally-copying drifts ±1). A
-   > coverage guardrail warns if the number of rendered assessment blocks
-   > doesn't match the number of customer questions, and if the gateway's
-   > `finish_reason` reports a truncated section a `TIA output TRUNCATED`
-   > WARNING is logged.
+   > it can never disagree with the detail (LLM tally-copying drifts ±1),
+   > and the coverage line above it is computed from the submitted answers
+   > — a report where a third of the questions came back "Don't know" would
+   > otherwise be indistinguishable from a clean one. A coverage guardrail
+   > warns if the number of rendered assessment blocks doesn't match the
+   > number of customer questions, and if the gateway's `finish_reason`
+   > reports a truncated section a `TIA output TRUNCATED` WARNING is logged.
 
 Each customer file is processed **independently and sequentially** —
 `INTERMEDIATE_JSON_DIR` is wiped between files so each report is
@@ -479,10 +577,13 @@ tests/
 ├── test_imports_smoke.py                      # every module imports cleanly
 ├── test_docx_writer.py
 ├── test_excel_to_json.py
+├── test_form_definition.py                    # form/flow drift vs intake/
 ├── test_http_resilient.py
 ├── test_logging_setup.py
 ├── test_rag_ingester.py
+├── test_reference_info_extractor.py
 ├── test_reference_sheet_extractor.py
+├── test_reference_sheet_extractor_prompt.py   # extraction prompt contract
 ├── test_reference_passthrough_ingester.py
 ├── test_run.py
 └── test_tia_generator.py
@@ -497,11 +598,11 @@ Deployment step 3. No extra install is needed before running the suite.
 
 From the project root, using the venv-Python:
 
-```powershell
-& .\.venv\Scripts\python.exe -m pytest -q
+```cmd
+.venv\Scripts\python.exe -m pytest -q
 ```
 
-Expected output ends with `230 passed` (in a few seconds) and exit code 0. If you
+Expected output ends with `283 passed` (in a few seconds) and exit code 0. If you
 see a failure, the line immediately above the summary identifies the
 file and test name.
 
@@ -509,7 +610,7 @@ file and test name.
 
 All commands below assume `pytest` is invoked through the venv-Python the
 same way as the full-suite command above. The leading
-`& .\.venv\Scripts\python.exe -m` is omitted for readability.
+`.venv\Scripts\python.exe -m` is omitted for readability.
 
 | Goal | Command |
 |------|---------|
@@ -557,8 +658,23 @@ same way as the full-suite command above. The leading
 - **`docx_writer` against the branded template** — cover fill
   (Organisation Title, fixed Subtitle, assessment date), Markdown →
   native Word style mapping (Heading 1/2, tables, bold runs),
-  missing-template fallback to a blank document, and output parent-dir
-  creation.
+  missing-template fallback to a blank document, output parent-dir
+  creation, and that no trace of the source document the template was
+  derived from (headers, document properties, property-bound controls)
+  reaches a generated report.
+- **Reference-workbook retirement** — the version-family match, the
+  move-not-delete into `Superseded\`, re-ingesting the same version
+  retiring nothing, unrelated workbooks left alone, and the retired copy
+  being invisible to the passthrough scan.
+- **Prompt contracts** — the extraction prompt still requires verbatim
+  question wording and canonical `guidance` / `remediation_steps` keys, and
+  its size-compaction rule cannot cut remediation actions.
+- **The intake record in `intake/`** — the form definition parses, keeps its
+  expected question and section counts, still carries the questions the
+  pipeline reads, and leaks no Microsoft-internal fields; the Power Automate
+  flow emits the nested question/answer shape and its question wording
+  matches the form verbatim. The flow tests skip when the gitignored export
+  is absent.
 
 ### Offline guarantee
 
@@ -630,10 +746,22 @@ machine without VPN or gateway access.
   `REFERENCE_TO_BE_LOADED_DIR` empty for xlsx). Passthrough files
   alone do **not** cause this — their basenames are stable across
   runs.
+- **`RAG sync SKIPPED: the reference extract stage failed ...`** — stage 1
+  did not finish, so the local rubric is partial and syncing it would
+  replace a complete rubric in RAG with the fragment. RAG is untouched and
+  the run exits non-zero. Fix the underlying extract failure (the preceding
+  ERROR names it — usually a rate limit or spend cap) and re-run; the
+  workbook is still in the inbox.
+- **`form defect: a 'Section:' header is embedded in the question text or
+  answer option of N field(s)`** — a questionnaire section header was typed
+  into a question title or an answer option in Microsoft Forms instead of
+  being created as a section break, so it arrives glued to real content. It
+  is stripped and never reaches the report, but the warning repeats on every
+  submission until the form itself is corrected. The named fields are the
+  ones to fix; re-export `intake/online_tia_form.json` afterwards.
 - **`logs.txt` keeps growing** — it shouldn't past 10 MB. If you see
   a single `logs.txt` much larger than that, the rotation handler
   isn't picking up (rare; typically a permissions or
-  multi-process-write contention issue). Confirm with
-  `Get-Item logs.txt | Select-Object Length`, and look for
-  `logs.txt.1` … `logs.txt.5` siblings — those are the rotated
+  multi-process-write contention issue). Confirm with `dir logs.txt`, and
+  look for `logs.txt.1` … `logs.txt.5` siblings — those are the rotated
   backups. Delete them manually if you want to reclaim disk.
