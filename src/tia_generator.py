@@ -16,6 +16,7 @@ import datetime as dt
 import json
 import logging
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -106,10 +107,20 @@ a criticality.
 - The ceiling only LOWERS a level. It never removes a finding, never turns a
   flagged row into "—", and never turns an unproblematic or administrative
   answer into a finding. A row needing no action stays unflagged (—).
+- EXEMPTION — open free-text questions. A catch-all such as "Is there anything
+  else about your environment, configuration, or known issues we should be
+  aware of?" can never have a guidance entry, because the guidance scores fixed
+  answer options and this question has none. It is also the one place a customer
+  describes a live problem in their own words. Rate what they actually report on
+  its merits, up to and including Red Flag — the ceiling does NOT apply here.
+  A customer reporting production instability must not be softened to Suggestion
+  merely because no rubric row exists for a free-text field.
 
 Style (strict): be concise. Short sentences. No consultant filler, no preamble, no
 closing summaries, and never restate a question in prose. Never explain the same
-fact twice. Table cells hold fragments or at most 2 short sentences. Narrative
+fact twice. Table cells hold fragments or at most 2 short sentences — except a
+Detail that must name several required remediation actions, which may run to 4.
+Completeness of a fix outranks brevity. Narrative
 paragraphs have at most 3 sentences. When a table row already states a finding, do
 NOT also narrate it elsewhere.
 
@@ -186,17 +197,12 @@ class TiaReportGenerator:
          "values VERBATIM from the authoritative analysis's Criticality Tally "
          "(ignore the row-ID lists in parentheses) — do not count or re-assess. "
          "No criticality definitions, no findings detail in this section."),
-        ("Key Findings",
-         "Begin with the exact heading line `## Key Findings`, then a numbered list "
-         "of ONLY the 8-12 most significant FLAGGED items from the Assessment "
-         "Ledger (highest criticality first). Every item must be a flagged row: "
-         "never include a configuration that needs no action. Each item: a bold "
-         "lead line "
-         "`**<Category> – <Subject> — <Criticality>**` with the criticality copied "
-         "from the ledger row, then 1-2 short paragraphs of specifics — the "
-         "customer's context, why it matters, and the suggested action, in the "
-         "advisory evidence-based tone. Do NOT cite "
-         "ledger row IDs (R1, R2, ...) anywhere. No table in this section."),
+        # Key Findings is NOT an LLM call. As one it repeatedly contradicted the
+        # ledger it summarised — inventing severities to meet a minimum count, and
+        # listing rows the ledger had left unflagged. It is now rendered in code
+        # from the same flagged rows the count table is computed from
+        # (`_render_key_findings`), so the two cannot disagree.
+        ("Key Findings", _CODE_RENDERED),
         ("General Information", _CODE_RENDERED),
         ("SQL Server", _CODE_RENDERED),
         ("Application Server(s)", _CODE_RENDERED),
@@ -206,9 +212,9 @@ class TiaReportGenerator:
         ("Security", _CODE_RENDERED),
         ("Outstanding Questions",
          "Begin with the exact heading line `## Outstanding Questions`. List ONLY "
-         "customer data keys whose answer was blank/missing or explicitly "
-         "ambiguous AND which do NOT already carry a criticality in the "
-         "assessment above, grouped by category, as one-line bullets with no "
+         "customer data keys whose answer was blank/missing or was 'Don't "
+         "know'/unsure — these are the points the assessment could not cover, so "
+         "list EVERY one of them, grouped by category, as one-line bullets with no "
          "commentary. Do NOT invent questions about topics the form never asked "
          "(e.g. CPU/RAM specs, auto-growth settings), do NOT repeat a flagged "
          "item, and do NOT invent answers. If nothing qualifies, write the single "
@@ -298,6 +304,18 @@ class TiaReportGenerator:
     # being made a section break — see `_strip_stray_section`. Anchored to the
     # end and stopping at '?' so it can never eat a real question's wording.
     _STRAY_SECTION_RE = re.compile(r"\s*\bSection:\s*[^?]*$")
+
+    # An answer that states the customer does not know. Distinct from a blank:
+    # they engaged with the question and could not answer it. Matched on the whole
+    # answer, so a multi-select like "Virtual servers; Don't know" is not treated
+    # as wholly unknown.
+    _UNKNOWN_ANSWER_RE = re.compile(
+        r"^(don'?t know|do not know|not known|unknown|unsure|n/?a)\b", re.I
+    )
+    # Shown instead of a criticality for such rows. Severity says "how bad is
+    # this"; an unknown says "we could not tell" — a different axis, so it gets
+    # its own bucket rather than competing at the bottom of the severity scale.
+    NOT_ASSESSED_LABEL = "Not assessed"
 
     # Ledger row IDs are internal machinery. The model sometimes cross-references
     # them inside a Detail ("...no index maintenance (R14), no archiving (R19)"),
@@ -429,6 +447,11 @@ class TiaReportGenerator:
                 "unverified draft analysis", exc,
             )
             analysis = draft_analysis
+        # An answer of "Don't know" is not a finding — strip any severity the
+        # model gave such a row BEFORE the sections are written from this text,
+        # so Key Findings, the count table and the rendered blocks all agree.
+        analysis = self._unflag_unknown_rows(analysis)
+
         # Audit trail: the verified analysis every section is anchored to.
         # DEBUG-level — enable LOG_LEVEL=DEBUG to diagnose section/ledger drift.
         logger.debug("TIA verified analysis:\n%s", analysis)
@@ -453,10 +476,17 @@ class TiaReportGenerator:
             logger.info(
                 "TIA section %d/%d: %s", i, len(self.REPORT_SECTIONS), title,
             )
+            if title == "Key Findings":
+                # Code-rendered from the same ledger the count table is computed
+                # from, so the two can never disagree.
+                section_texts.append(
+                    self._render_key_findings(ledger_rows, self._questions)
+                )
+                continue
             if title in self._DETAILED_CATEGORIES:
                 rendered = self._render_category(
                     title, ledger_rows, first=not detailed_opened,
-                    questions=self._questions,
+                    questions=self._questions, fields=self._fields,
                 )
                 # An empty category renders as "" and is dropped at assembly, but
                 # the placeholder is still appended: `_reconcile_summary_counts`
@@ -500,6 +530,35 @@ class TiaReportGenerator:
         self._reconcile_summary_counts(section_texts)
         return self._write_outputs(section_texts, filename_prefix)
 
+    def _answer_coverage_line(self) -> str:
+        """A one-line statement of how much of the questionnaire could actually
+        be assessed, placed above the Summary count table.
+
+        Without it a report where the customer answered "Don't know" to a third
+        of the questions is indistinguishable from one where everything was
+        answered and only minor items were found — the count table alone looks
+        reassuring in both cases. Computed in code from the submitted answers,
+        so it cannot drift from what was actually provided.
+        """
+        answers = [f["answer"] for f in self._fields.values()]
+        if not answers:
+            return ""
+        blank = sum(1 for a in answers if not str(a).strip())
+        unknown = sum(1 for a in answers if self._is_unknown_answer(a))
+        answered = len(answers) - blank - unknown
+        if not (blank or unknown):
+            return f"All {len(answers)} questions were answered.\n\n"
+        gaps = []
+        if unknown:
+            gaps.append(f"{unknown} answered “Don't know”")
+        if blank:
+            gaps.append(f"{blank} left blank")
+        return (
+            f"{answered} of {len(answers)} questions were answered "
+            f"({'; '.join(gaps)}), so the findings below cover only the part of "
+            "the environment that could be assessed.\n\n"
+        )
+
     def _reconcile_summary_counts(self, section_texts: list[str]) -> None:
         """Recount criticalities from the rendered Detailed Assessment blocks and
         overwrite the Summary section's count table with the result. Mutates
@@ -515,9 +574,13 @@ class TiaReportGenerator:
         ]
         counts = self._count_criticalities(category_texts)
 
+        rows = [*self.CRITICALITY_LEVELS]
+        if counts.get(self.NOT_ASSESSED_LABEL):
+            rows.append(self.NOT_ASSESSED_LABEL)
         canonical = (
-            "| Criticality | Number of instances |\n|---|---|\n"
-            + "\n".join(f"| {lv} | {counts[lv]} |" for lv in self.CRITICALITY_LEVELS)
+            self._answer_coverage_line()
+            + "| Criticality | Number of instances |\n|---|---|\n"
+            + "\n".join(f"| {lv} | {counts[lv]} |" for lv in rows)
             + "\n"
         )
         summary = section_texts[summary_idx]
@@ -632,8 +695,8 @@ class TiaReportGenerator:
         A WARNING names them, since a non-empty backfill means the analysis pass
         under-produced and the prompt may need attention.
         """
-        seen = {r["subject"] for r in rows}
-        missing = [key for key in fields if key not in seen]
+        seen = {cls._subject_key(r["subject"]) for r in rows}
+        missing = [key for key in fields if cls._subject_key(key) not in seen]
         if not missing:
             return rows
         logger.warning(
@@ -659,9 +722,49 @@ class TiaReportGenerator:
         return "" if value.strip() in ("", "—", "–", "-") else value.strip()
 
     @classmethod
+    def _render_key_findings(
+        cls, rows: list[dict], questions: dict[str, str] | None = None,
+        limit: int = 12,
+    ) -> str:
+        """Render `## Key Findings` in code from the flagged ledger rows.
+
+        This was an LLM section and repeatedly disagreed with the ledger it was
+        supposed to summarise — inventing severities to fill a quota, and listing
+        rows the ledger had left unflagged. Three prompt attempts each moved the
+        symptom without fixing it, so the section is now derived the same way the
+        Detailed Assessment is: severity order, criticality copied from the row,
+        prose from its Detail. It cannot contradict the count table because both
+        are computed from the same rows.
+        """
+        order = {lv: i for i, lv in enumerate(cls.CRITICALITY_LEVELS)}
+        flagged = [r for r in rows if r["criticality"] in order]
+        flagged.sort(key=lambda r: order[r["criticality"]])
+
+        out = ["## Key Findings", ""]
+        if not flagged:
+            out.append("No findings were raised.")
+            return "\n".join(out)
+
+        by_key = {cls._subject_key(k): v for k, v in (questions or {}).items()}
+        for n, r in enumerate(flagged[:limit], start=1):
+            subject = r["subject"] or by_key.get(cls._subject_key(r["subject"]), "")
+            out.append(f"{n}. **{r['category']} – {subject} — {r['criticality']}**")
+            out.append("")
+            if r["detail"]:
+                out.append(r["detail"])
+                out.append("")
+        if len(flagged) > limit:
+            out.append(
+                f"A further {len(flagged) - limit} lower-severity findings are "
+                "listed in the Detailed Assessment."
+            )
+        return "\n".join(out).rstrip()
+
+    @classmethod
     def _render_category(
         cls, category: str, rows: list[dict], *, first: bool,
         questions: dict[str, str] | None = None,
+        fields: dict[str, dict[str, str]] | None = None,
     ) -> str:
         """Render one Detailed Assessment category section in code from the
         ledger rows assigned to it — one numbered Q&A block per row (full
@@ -673,6 +776,13 @@ class TiaReportGenerator:
         was asked. Because a ledger row's Subject is that key copied
         character-for-character, the heading is looked up there first — so it is
         the form's own wording rather than the model's transcription of it.
+
+        `fields` carries the submitted answers. The Answer line is printed from
+        there, VERBATIM: the ledger's Answer cell had been quietly rewording the
+        customer — abbreviating job titles, and translating a Spanish free-text
+        answer into English — so a report sent back to that customer no longer
+        showed what they wrote. When the ledger's version differs (i.e. the model
+        translated it), that rendering is shown beneath as `Translation:`.
         """
         cat_rows = [
             r for r in rows if r["category"].strip().lower() == category.lower()
@@ -687,27 +797,106 @@ class TiaReportGenerator:
         if first:
             out += ["## Detailed Assessment", "", _DETAILED_ASSESSMENT_LEAD, ""]
         out += [f"### {category}", ""]
+        by_key = {cls._subject_key(k): v for k, v in (questions or {}).items()}
+        answers = {cls._subject_key(k): v.get("answer", "")
+                   for k, v in (fields or {}).items()}
         for n, r in enumerate(cat_rows, start=1):
-            from_form = (questions or {}).get(r["subject"], "")
+            from_form = by_key.get(cls._subject_key(r["subject"]), "")
             heading = from_form or r["question"] or r["subject"]
-            crit = f" — {r['criticality']}" if r["criticality"] else ""
+            # A "Don't know" answer is labelled Not assessed rather than carrying
+            # a severity: the customer's uncertainty is not a mild version of a
+            # real finding, and letting it sit at the bottom of the scale made a
+            # customer who could not answer look healthier than one who could.
+            label = (cls.NOT_ASSESSED_LABEL
+                     if cls._is_unknown_answer(r["answer"]) else r["criticality"])
+            crit = f" — {label}" if label else ""
             out.append(f"**{n}. {heading}{crit}**")
-            out.append(f"Answer: {r['answer']}")
-            if r["criticality"] and r["detail"]:
+            submitted = answers.get(cls._subject_key(r["subject"]), "")
+            # Newlines are flattened so the answer stays one line; every word the
+            # customer wrote is kept.
+            verbatim = re.sub(r"\s*\n+\s*", "; ", submitted).strip()
+            out.append(f"Answer: {verbatim or r['answer'] or 'not provided'}")
+            rendered = str(r["answer"] or "").strip()
+            if verbatim and rendered and not cls._same_text(rendered, verbatim):
+                out.append(f"Translation: {rendered}")
+            if label and r["detail"]:
                 out.append(f"Recommendation: {r['detail']}")
             out.append("")
         return "\n".join(out).rstrip()
+
+    @staticmethod
+    def _subject_key(value: str) -> str:
+        """Normalise a ledger Subject / data key for matching.
+
+        The model is told to copy the data key character-for-character, but a
+        difference in case or spacing makes the row miss its question TWICE: the
+        heading falls back to the model's paraphrase, and `_backfill_missing_rows`
+        believes the question is absent and adds a second block for it.
+        """
+        return re.sub(r"\s+", " ", str(value or "")).strip().casefold()
+
+    @staticmethod
+    def _same_text(a: str, b: str) -> bool:
+        """True when two renderings differ only in punctuation or formatting.
+
+        Decides whether to print a `Translation:` line. Comparing on whitespace
+        and case alone was far too lax: it treated "1300" vs "1,300", "0-5 ms"
+        vs "0–5 ms" and a ";" swapped for a "/" as translations, so four of five
+        lines in a real report were noise. Stripping everything but letters and
+        digits leaves only a genuine change of wording.
+        """
+        def norm(s: str) -> str:
+            s = unicodedata.normalize("NFKC", str(s or ""))
+            return re.sub(r"[^\w]", "", s, flags=re.UNICODE).casefold()
+        return norm(a) == norm(b)
+
+    @classmethod
+    def _is_unknown_answer(cls, answer: str) -> bool:
+        """True when the customer stated they do not know the answer."""
+        return bool(cls._UNKNOWN_ANSWER_RE.match(str(answer or "").strip()))
+
+    @classmethod
+    def _unflag_unknown_rows(cls, analysis: str) -> str:
+        """Blank the Criticality of every ledger row whose Answer is "Don't know".
+
+        The narrative sections are written from the analysis TEXT, not from the
+        parsed ledger, so correcting only the rendered blocks left Key Findings
+        still calling these rows "Suggestion" while the count table and the
+        Detailed Assessment called them "Not assessed" — a contradiction inside
+        one report. Rewriting the source table fixes every consumer at once.
+        """
+        out, changed = [], 0
+        for line in analysis.splitlines():
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if (line.strip().startswith("|") and len(cells) >= 6
+                    and re.fullmatch(r"(?i)R\d+", cells[0])
+                    and cls._is_unknown_answer(cells[4])
+                    and cells[5] not in ("", "—", "-")):
+                cells[5] = "—"
+                out.append("| " + " | ".join(cells) + " |")
+                changed += 1
+                continue
+            out.append(line)
+        if changed:
+            logger.info(
+                "unflagged %d ledger row(s) whose answer was \"Don't know\" — "
+                "they are reported as Not assessed, not as findings", changed,
+            )
+        return "\n".join(out)
 
     @classmethod
     def _count_criticalities(cls, category_texts: list[str]) -> dict[str, int]:
         """Tally criticalities from the numbered Q&A block headings across the
         Detailed Assessment category sections. A heading ends with
-        ` — <Criticality>` when flagged; unflagged blocks are not counted."""
-        counts = {lv: 0 for lv in cls.CRITICALITY_LEVELS}
+        ` — <Criticality>` when flagged; unflagged blocks are not counted.
+        `Not assessed` is tallied alongside them so the Summary table can show
+        what could not be judged without it competing on the severity scale."""
+        counts = {lv: 0 for lv in (*cls.CRITICALITY_LEVELS, cls.NOT_ASSESSED_LABEL)}
         for text in category_texts:
             for heading in cls._BLOCK_LEAD_RE.findall(text):
                 h = heading.strip()
-                for lv in cls.CRITICALITY_LEVELS:  # Strong Recommendation first
+                # Strong Recommendation before Recommendation (suffix overlap).
+                for lv in (*cls.CRITICALITY_LEVELS, cls.NOT_ASSESSED_LABEL):
                     if h.endswith(f"— {lv}") or h.endswith(f"– {lv}"):
                         counts[lv] += 1
                         break
@@ -724,6 +913,7 @@ class TiaReportGenerator:
         self._warn_version_leaks(markdown)
         self._warn_ledger_id_leaks(markdown)
         self._warn_guidance_leaks(markdown)
+        self._warn_orphan_bullet_lists(markdown)
         self._warn_coverage(markdown, len(self._customer_keys))
         self.output_dir.mkdir(parents=True, exist_ok=True)
         out_path = self._build_output_path(filename_prefix)
@@ -969,18 +1159,27 @@ class TiaReportGenerator:
             "key's own 'question' field from the customer data (the exact wording "
             "the customer was asked), copied verbatim; leave Question blank only "
             "when that field is absent or empty. Answer is their answer (verbatim, abbreviated "
-            "if long); Detail is the recommendation in at most 2 short sentences, "
+            "if long — but if the customer wrote in a language other than English, "
+            "put a faithful ENGLISH TRANSLATION of their answer here instead, "
+            "complete and unabbreviated; the report prints their original wording "
+            "verbatim and shows this translation beneath it); Detail is the "
+            "recommendation in at most 2 short sentences, "
             "filled ONLY for flagged rows and phrased per the tone rules — the "
             "observed gap and its consequence, then the advisory suggestion. "
             "Where the REFERENCE SCORING GUIDANCE states a reason for a rating, "
-            "the Detail must use that reason.\n"
+            "the Detail must use that reason. Where the guidance supplies "
+            "'remediation_steps' (or a 'guidance' value naming more than one "
+            "required action), the Detail must name EVERY one of them — use up to "
+            "4 short sentences for such a row instead of 2. A partial fix is worse "
+            "than none: never list two of three required actions.\n"
             "Answer-handling rules: a BLANK or missing answer → Answer is 'not "
             "provided', Criticality —, no Detail; it belongs in Outstanding "
             "Questions, never as a finding. An explicitly uncertain answer "
-            "('Don't know', 'maybe') MAY be flagged — the finding is the "
-            "uncertainty itself and the Detail says what to confirm and why it "
-            "matters; a row flagged this way is NOT repeated in Outstanding "
-            "Questions.\n\n"
+            "('Don't know', 'unsure') is NOT a finding either — the environment "
+            "could not be assessed on that point. Give the row Criticality — and "
+            "put what needs confirming, and why it matters, in the Detail; the "
+            "report labels such rows 'Not assessed' and lists them under "
+            "Outstanding Questions.\n\n"
             "## Criticality Tally\n"
             "Four lines, one per criticality, in this exact form:\n"
             "Red Flag: N (R_, R_, ...)\n"
@@ -1039,7 +1238,10 @@ class TiaReportGenerator:
             "guidance entries by subject matter, not wording — a differently "
             "phrased entry whose options fit the answer DOES cover the question, "
             "so keep its rating as-is. Downgrading is the only change permitted "
-            "here: never unflag a row and never delete one.\n"
+            "here: never unflag a row and never delete one. The ceiling does NOT "
+            "apply to open free-text questions (the 'anything else / known "
+            "issues' catch-all) — leave a problem the customer described in their "
+            "own words at the level it warrants, up to Red Flag.\n"
             "- Re-check every figure in Environment Facts against the customer "
             "answers.\n"
             "- Re-count the Criticality Tally from the corrected ledger.\n\n"
@@ -1081,6 +1283,36 @@ class TiaReportGenerator:
         if m:
             logger.warning(
                 "TIA report may name a reference document version: %r", m.group(0)
+            )
+
+    @classmethod
+    def _warn_orphan_bullet_lists(cls, markdown: str) -> None:
+        """Log-only guardrail: a bullet list must be introduced by a stem line
+        ending in ':'.
+
+        Bullets that follow a completed sentence read as a continuation of it —
+        where that sentence states a risk, the reader cannot tell whether the
+        list is more findings or the fix. A heading or a bold label is its own
+        signpost (Outstanding Questions groups by category that way), so only a
+        run that follows prose ending in . ! or ? is flagged.
+        """
+        lines = markdown.splitlines()
+        orphans: list[str] = []
+        for i, line in enumerate(lines):
+            starts_run = line.lstrip().startswith("- ") and not (
+                i and lines[i - 1].lstrip().startswith("- ")
+            )
+            if not starts_run:
+                continue
+            prev = next((p.strip() for p in reversed(lines[:i]) if p.strip()), "")
+            if prev.endswith((".", "!", "?")):
+                orphans.append(line.strip()[:60])
+        if orphans:
+            logger.warning(
+                "TIA report has %d bullet list(s) with no introducing stem line "
+                "(the paragraph before ends mid-thought, so the reader cannot "
+                "tell the bullets are the remediation): %s",
+                len(orphans), "; ".join(orphans),
             )
 
     @classmethod

@@ -531,11 +531,11 @@ def test_generate_produces_all_sections(tmp_path, monkeypatch) -> None:
     out = gen.generate(src, filename_prefix="TIA_test")
     text = out.read_text(encoding="utf-8")
 
-    # Only analysis, verification, and the 3 narrative sections are LLM calls —
-    # the 7 Detailed Assessment categories are code-rendered.
+    # Only analysis, verification and 2 narrative sections are LLM calls — the 7
+    # Detailed Assessment categories AND Key Findings are code-rendered.
     assert seen_sections == [
         TiaReportGenerator.ANALYSIS_LABEL, TiaReportGenerator.VERIFICATION_LABEL,
-        "Summary", "Key Findings", "Outstanding Questions",
+        "Summary", "Outstanding Questions",
     ]
     assert text.startswith("# Technical Infrastructure Assessment")
     for h in ("## Summary", "## Key Findings", "## Detailed Assessment",
@@ -578,7 +578,7 @@ def test_generate_writes_partial_report_on_section_failure(tmp_path, monkeypatch
     (src / "a.json").write_text(_customer_json(), encoding="utf-8")
     gen = _make_gen(tmp_path)
 
-    fail_on = "Key Findings"   # an LLM section (categories can't fail — code-rendered)
+    fail_on = "Outstanding Questions"   # an LLM section (Key Findings and the categories are code-rendered)
 
     def fake_call(self, user_message, section=None, read_timeout=None):
         if section in (TiaReportGenerator.ANALYSIS_LABEL,
@@ -827,8 +827,10 @@ def test_analysis_directive_three_part_ledger() -> None:
     assert "General Information" in d                     # renamed category (no clash)
     assert "backup and recovery questions" in d           # category mapping anchor
     assert "'not provided'" in d                          # blank answers -> no finding
-    assert "'Don't know'" in d                            # uncertain answers may be flagged
-    assert "NOT repeated in Outstanding Questions" in d   # no double-counting
+    # "Don't know" is not a finding — the point could not be assessed.
+    assert "'Don't know', 'unsure') is NOT a finding" in d
+    # Unknowns are routed to Outstanding Questions rather than counted as findings.
+    assert "lists them under Outstanding Questions" in d
     assert "never merge two keys" in d                    # no fabricated/merged rows
     # Question wording now comes from the customer data's own 'question' field
     # (carried by the form export), not from the reference scoring guidance.
@@ -860,16 +862,223 @@ def test_uncovered_questions_are_capped_at_suggestion() -> None:
     assert "downgrade a Criticality above Suggestion to Suggestion" in audit
 
 
-def test_key_findings_hint_carries_criticality() -> None:
-    """Key Findings lists flagged items only, each showing its criticality —
-    positive confirmations are not a finding and must not appear there."""
-    hints = dict(TiaReportGenerator.REPORT_SECTIONS)
-    h = hints["Key Findings"]
-    assert "## Key Findings" in h
-    assert "`**<Category> – <Subject> — <Criticality>**`" in h
-    assert "never include a configuration that needs no action" in h
-    assert "Positive Confirmations" not in h
-    assert "✓" not in h
+def test_multi_step_remediations_must_be_reported_in_full() -> None:
+    """A rubric entry whose fix has several required actions (e.g. Runtime
+    Resource authentication needs a switch, a user role AND a setting) must reach
+    the report whole — a partial fix sends the customer away half-remediated."""
+    directive = TiaReportGenerator._analysis_directive()
+    assert "remediation_steps" in directive
+    assert "must name EVERY one of them" in directive
+    assert "never list two of three required actions" in directive
+    # Brevity rules must not silently truncate those steps.
+    assert "Completeness of a fix outranks brevity" in TIA_SYSTEM_PROMPT
+
+
+@pytest.mark.parametrize("answer, unknown", [
+    ("Don't know", True), ("don't know", True), ("Dont know", True),
+    ("Unknown", True), ("Unsure", True), ("N/A", True), ("", False),
+    ("Yes", False), ("Physical server", False),
+    # A multi-select that merely includes it is still a real answer.
+    ("Virtual servers or desktops; Don't know", False),
+])
+def test_is_unknown_answer(answer: str, unknown: bool) -> None:
+    assert TiaReportGenerator._is_unknown_answer(answer) is unknown
+
+
+def test_unknown_answers_render_as_not_assessed_not_a_severity() -> None:
+    """A customer who cannot answer must not look healthier than one who can:
+    "Don't know" gets its own bucket instead of sitting at the bottom of the
+    severity scale."""
+    rows = [
+        {"category": "Security", "subject": "Antivirus", "question": "AV?",
+         "answer": "Don't know", "criticality": "Suggestion", "detail": "Confirm it."},
+        {"category": "Security", "subject": "RR auth", "question": "Auth?",
+         "answer": "No", "criticality": "Strong Recommendation", "detail": "Fix it."},
+    ]
+    out = TiaReportGenerator._render_category("Security", rows, first=False)
+    assert "— Not assessed**" in out
+    assert "Antivirus? — Suggestion" not in out
+    assert "— Strong Recommendation**" in out        # real findings unaffected
+    assert "Recommendation: Confirm it." in out      # the follow-up still shows
+
+
+def test_unflag_unknown_rows_clears_severity_in_the_source_ledger() -> None:
+    """Key Findings is written from the analysis TEXT, so the severity has to be
+    cleared there — not just in the rendered blocks — or Key Findings calls a row
+    "Suggestion" while the count table calls it "Not assessed"."""
+    analysis = _ledger_analysis([
+        ("Security", "Antivirus", "AV?", "Don't know", "Suggestion", "Confirm it."),
+        ("Security", "RR auth", "Auth?", "No", "Strong Recommendation", "Fix it."),
+    ])
+    out = TiaReportGenerator._unflag_unknown_rows(analysis)
+    rows = {r["subject"]: r for r in TiaReportGenerator._parse_ledger(out)}
+    assert rows["Antivirus"]["criticality"] is None       # unknown -> unflagged
+    assert rows["Antivirus"]["detail"] == "Confirm it."   # follow-up preserved
+    assert rows["RR auth"]["criticality"] == "Strong Recommendation"
+
+
+def test_unflag_unknown_rows_leaves_a_clean_ledger_untouched() -> None:
+    analysis = _ledger_analysis([
+        ("SQL Server", "Encryption", "Enc?", "No", "Red Flag", "Encrypt it."),
+    ])
+    assert TiaReportGenerator._unflag_unknown_rows(analysis) == analysis
+
+
+def test_answer_coverage_line_reports_gaps(tmp_path: Path) -> None:
+    gen = _make_gen(tmp_path)
+    gen._fields = {
+        "a": {"question": "a?", "answer": "Yes"},
+        "b": {"question": "b?", "answer": "Don't know"},
+        "c": {"question": "c?", "answer": "Don't know"},
+        "d": {"question": "d?", "answer": ""},
+    }
+    line = gen._answer_coverage_line()
+    assert "1 of 4 questions were answered" in line
+    assert "2 answered" in line and "1 left blank" in line
+
+
+def test_answer_coverage_line_when_everything_answered(tmp_path: Path) -> None:
+    gen = _make_gen(tmp_path)
+    gen._fields = {"a": {"question": "a?", "answer": "Yes"}}
+    assert gen._answer_coverage_line() == "All 1 questions were answered.\n\n"
+
+
+def test_key_findings_is_code_rendered_not_an_llm_call() -> None:
+    """As an LLM section it kept contradicting the ledger it summarised."""
+    from tia_generator import _CODE_RENDERED
+    assert dict(TiaReportGenerator.REPORT_SECTIONS)["Key Findings"] == _CODE_RENDERED
+
+
+def test_orphan_bullet_list_is_flagged(caplog) -> None:
+    """A list introduced by a completed sentence is an orphan."""
+    md = ("## Key Findings\n\nThis removes a layer of access control in "
+          "production.\n\n- Add the /sso switch.\n- Untick anonymous.\n")
+    with caplog.at_level("WARNING"):
+        TiaReportGenerator._warn_orphan_bullet_lists(md)
+    assert "no introducing stem line" in caplog.text
+
+
+def test_bullets_after_a_stem_or_a_label_are_not_flagged(caplog) -> None:
+    """A colon stem introduces the list; a heading or bold label is its own
+    signpost (Outstanding Questions groups by category that way)."""
+    md = ("## Key Findings\n\nThree changes are required:\n\n- Add the switch.\n"
+          "\n## Outstanding Questions\n\n**SQL Server**\n- Retention not stated.\n"
+          "\n### Security\n- Something else.\n")
+    with caplog.at_level("WARNING"):
+        TiaReportGenerator._warn_orphan_bullet_lists(md)
+    assert "no introducing stem line" not in caplog.text
+
+
+def test_free_text_catch_all_is_exempt_from_the_ceiling() -> None:
+    """The "anything else / known issues" question can never have a rubric entry,
+    yet it is where a customer reports a live problem. Capping it at Suggestion
+    would soften real production instability, so it is exempt."""
+    assert "EXEMPTION — open free-text questions" in TIA_SYSTEM_PROMPT
+    assert "up to and including Red Flag" in TIA_SYSTEM_PROMPT
+    assert "must not be softened to Suggestion" in TIA_SYSTEM_PROMPT
+    # The audit pass must not undo the exemption.
+    audit = TiaReportGenerator._verification_directive("draft")
+    assert "does NOT\napply to open free-text questions" in audit.replace(
+        "does NOT apply", "does NOT\napply")
+
+
+def _row(cat, subj, crit, detail="d", answer="No"):
+    return {"category": cat, "subject": subj, "question": f"{subj}?",
+            "answer": answer, "criticality": crit, "detail": detail}
+
+
+def test_answer_is_printed_verbatim_from_the_submission() -> None:
+    """The ledger's Answer cell had been rewording the customer — abbreviating a
+    job title, translating Spanish into English. A report sent back to that
+    customer must show what they actually wrote."""
+    rows = [{"category": "General Information", "subject": "Anything else",
+             "question": "q", "answer": "Platform deployed on Azure, redundant "
+                                        "Application Servers.",
+             "criticality": None, "detail": ""}]
+    fields = {"Anything else": {
+        "question": "Anything else?",
+        "answer": "Plataforma desplegada sobre Azure, con servidores de "
+                  "aplicación redundados."}}
+    out = TiaReportGenerator._render_category(
+        "General Information", rows, first=False, fields=fields)
+    assert "Answer: Plataforma desplegada sobre Azure" in out
+    assert "Translation: Platform deployed on Azure" in out
+
+
+@pytest.mark.parametrize("submitted, rendered, same", [
+    # All four were printed as bogus "translations" in a real report.
+    ("Álvaro Núñez Martín; Responsable del servicio",
+     "Álvaro Núñez Martín / Responsable del servicio", True),
+    ("1300", "1,300", True),
+    ("Public cloud managed database - PaaS",
+     "Public cloud managed database – PaaS", True),
+    ("0-5 ms", "0–5 ms", True),
+    # A genuine translation must still be detected as different.
+    ("Plataforma desplegada sobre Azure, con servidores redundados",
+     "Platform deployed on Azure, with redundant servers", False),
+])
+def test_same_text_ignores_punctuation_but_not_wording(
+        submitted: str, rendered: str, same: bool) -> None:
+    assert TiaReportGenerator._same_text(submitted, rendered) is same
+
+
+def test_no_translation_line_when_the_answer_was_copied() -> None:
+    """An English answer copied unchanged needs no translation line."""
+    rows = [{"category": "SQL Server", "subject": "Auto statistics", "question": "q",
+             "answer": "Both enabled", "criticality": None, "detail": ""}]
+    fields = {"Auto statistics": {"question": "q?", "answer": "Both  enabled"}}
+    out = TiaReportGenerator._render_category(
+        "SQL Server", rows, first=False, fields=fields)
+    assert "Answer: Both  enabled" in out
+    assert "Translation:" not in out
+
+
+def test_multiline_answer_is_flattened_but_keeps_every_word() -> None:
+    rows = [{"category": "General Information", "subject": "Name and role",
+             "question": "q", "answer": "A - Manager; B - BA",
+             "criticality": None, "detail": ""}]
+    fields = {"Name and role": {"question": "q?",
+                                "answer": "A - Manager\nB - Business Analyst"}}
+    out = TiaReportGenerator._render_category(
+        "General Information", rows, first=False, fields=fields)
+    assert "Answer: A - Manager; B - Business Analyst" in out
+    assert "BA" not in out.split("Translation:")[0]   # not abbreviated in the Answer
+
+
+def test_render_key_findings_lists_flagged_rows_worst_first() -> None:
+    out = TiaReportGenerator._render_key_findings([
+        _row("SQL Server", "Log levels", "Suggestion"),
+        _row("Security", "RR auth", "Red Flag"),
+        _row("App", "Load balancer", "Strong Recommendation"),
+    ])
+    order = [out.index(s) for s in ("Red Flag", "Strong Recommendation", "Suggestion")]
+    assert order == sorted(order)
+    assert out.startswith("## Key Findings")
+    assert "✓" not in out
+
+
+def test_render_key_findings_omits_unflagged_and_unassessed_rows() -> None:
+    """The exact contradiction this replaced: unflagged rows being listed as
+    findings while the count table reported none."""
+    out = TiaReportGenerator._render_key_findings([
+        _row("Security", "Antivirus", None, answer="Don't know"),
+        _row("SQL Server", "Encryption", "Red Flag"),
+    ])
+    assert "Antivirus" not in out
+    assert "Encryption" in out
+
+
+def test_render_key_findings_with_nothing_flagged() -> None:
+    out = TiaReportGenerator._render_key_findings(
+        [_row("Security", "Antivirus", None, answer="Don't know")])
+    assert out.rstrip().endswith("No findings were raised.")
+
+
+def test_render_key_findings_caps_the_list_and_says_so() -> None:
+    rows = [_row("SQL Server", f"S{i}", "Suggestion") for i in range(15)]
+    out = TiaReportGenerator._render_key_findings(rows, limit=12)
+    assert len(re.findall(r"^\d+\. \*\*", out, re.M)) == 12
+    assert "A further 3 lower-severity findings" in out
 
 
 def test_count_criticalities_tallies_block_headings() -> None:
@@ -882,11 +1091,14 @@ def test_count_criticalities_tallies_block_headings() -> None:
         "**3. Database size and growth**\nAnswer: 1111 GB\n\n"       # unflagged
         "**4. Backup method? — Recommendation**\nAnswer: Full\n"
     )
-    sec = "### Security\n**1. Antivirus? — Red Flag**\nAnswer: No\n"
+    sec = ("### Security\n**1. Antivirus? — Red Flag**\nAnswer: No\n\n"
+           "**2. Encryption keys? — Not assessed**\nAnswer: Don't know\n")
     counts = TiaReportGenerator._count_criticalities([sql, sec])
     assert counts == {
         "Red Flag": 2, "Strong Recommendation": 1,
         "Recommendation": 1, "Suggestion": 0,
+        # Tallied alongside the severities, but never as one of them.
+        "Not assessed": 1,
     }
 
 
@@ -1013,13 +1225,27 @@ def test_extraction_prompt_preserves_full_question() -> None:
 
 
 def test_outstanding_questions_hint_is_grounded() -> None:
-    """Outstanding Questions lists only real blank/ambiguous form answers, never
-    invented reference topics or repeated findings."""
+    """Outstanding Questions lists the points the assessment could not cover —
+    real blank or "Don't know" answers — never invented reference topics."""
     hints = dict(TiaReportGenerator.REPORT_SECTIONS)
     h = hints["Outstanding Questions"]
-    assert "blank/missing or explicitly" in h
-    assert "do NOT already carry a criticality" in h
+    assert "blank/missing or was 'Don't know'/unsure" in h
+    assert "list EVERY one of them" in h
     assert "topics the form never asked" in h
+
+
+def test_key_findings_criticalities_cannot_exceed_the_count_table() -> None:
+    """Both are derived from the same rows, so the section can no longer claim a
+    severity the table does not have — the bug that produced six invented Strong
+    Recommendations against a table reading zero."""
+    rows = [_row("Security", "RR auth", "Red Flag"),
+            _row("SQL Server", "Log levels", "Suggestion"),
+            _row("App", "Hosting", None, answer="Don't know")]
+    kf = TiaReportGenerator._render_key_findings(rows)
+    listed = re.findall(r"^\d+\. \*\*.*— (.+?)\*\*$", kf, re.M)
+    from collections import Counter
+    ledger = Counter(r["criticality"] for r in rows if r["criticality"])
+    assert Counter(listed) == ledger
 
 
 def test_output_forbids_naming_the_rubric() -> None:
@@ -1154,8 +1380,8 @@ def test_generate_injects_guidance_into_analysis_and_verification_only(
     # Only the narrative LLM sections make a call; none carry the guidance.
     assert set(messages) - {TiaReportGenerator.ANALYSIS_LABEL,
                             TiaReportGenerator.VERIFICATION_LABEL} == {
-        "Summary", "Key Findings", "Outstanding Questions"}
-    for title in ("Summary", "Key Findings", "Outstanding Questions"):
+        "Summary", "Outstanding Questions"}
+    for title in ("Summary", "Outstanding Questions"):
         assert marker not in messages[title], f"guidance leaked into '{title}'"
 
 
