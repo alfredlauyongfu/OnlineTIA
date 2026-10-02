@@ -211,25 +211,39 @@ def main() -> int:
     # and re-uploads from scratch.
     logger.info("--- stage: sync RAG with reference extractions ---")
     rc_rag = 0
-    try:
-        loaded_dir = Path(os.environ["REFERENCE_LOADED_DIR"])
-        loaded_passthrough = sorted(
-            p for pat in PASSTHROUGH_PATTERNS for p in loaded_dir.glob(pat)
-        ) if loaded_dir.is_dir() else []
-        rag.ingest_directory(
-            Path(os.environ["REFERENCE_JSON_DIR"]),
-            tags=["tia_reference"],
-            glob_pattern="extracted_*.json",
-            extra_files=loaded_passthrough,
+    if rc_ref:
+        # The extract stage failed, so REFERENCE_JSON_DIR holds a PARTIAL rubric
+        # (a sheet hit a rate limit, spend cap, or malformed response). Syncing
+        # it would delete the complete rubric already in RAG and replace it with
+        # the fragment — every later report would then be graded against a
+        # rubric missing whole topics, with nothing to show it. Leave RAG as it
+        # is; the next run retries the extraction.
+        logger.error(
+            "RAG sync SKIPPED: the reference extract stage failed, so the local "
+            "rubric is incomplete. The existing RAG contents are left untouched "
+            "to avoid replacing a complete rubric with a partial one."
         )
-    except (RagGatewayError, *TRANSIENT_ERRORS) as exc:
-        logger.error("RAG sync FAILED: %s", exc)
         rc_rag = 1
-    except FileNotFoundError as exc:
-        # REFERENCE_JSON_DIR doesn't exist yet (no reference has been
-        # processed). Not fatal — the TIA stage will fail visibly if it
-        # tries to use empty RAG state.
-        logger.warning("RAG sync skipped: %s", exc)
+    else:
+        try:
+            loaded_dir = Path(os.environ["REFERENCE_LOADED_DIR"])
+            loaded_passthrough = sorted(
+                p for pat in PASSTHROUGH_PATTERNS for p in loaded_dir.glob(pat)
+            ) if loaded_dir.is_dir() else []
+            rag.ingest_directory(
+                Path(os.environ["REFERENCE_JSON_DIR"]),
+                tags=["tia_reference"],
+                glob_pattern="extracted_*.json",
+                extra_files=loaded_passthrough,
+            )
+        except (RagGatewayError, *TRANSIENT_ERRORS) as exc:
+            logger.error("RAG sync FAILED: %s", exc)
+            rc_rag = 1
+        except FileNotFoundError as exc:
+            # REFERENCE_JSON_DIR doesn't exist yet (no reference has been
+            # processed). Not fatal — the TIA stage will fail visibly if it
+            # tries to use empty RAG state.
+            logger.warning("RAG sync skipped: %s", exc)
 
     # Per-file primary + TIA stage. Each customer xlsx is processed end-to-end
     # in isolation: wipe INTERMEDIATE_JSON_DIR, convert ONLY this file, run

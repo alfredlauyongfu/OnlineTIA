@@ -24,13 +24,80 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
-from excel_to_json import ExcelToJsonConverter
+from excel_to_json import ExcelToJsonConverter, move_replacing
 from reference_sheet_extractor import ReferenceSheetExtractor
 
 
 logger = logging.getLogger(__name__)
+
+# Older versions of a re-ingested workbook are moved here, inside
+# REFERENCE_LOADED_DIR. A subfolder is safe: run.py's passthrough scan globs
+# REFERENCE_LOADED_DIR non-recursively, so nothing in here reaches RAG.
+SUPERSEDED_DIR_NAME = "Superseded"
+
+# A trailing version token: "V2.6.5", "v2.6", "2.6.5".
+_VERSION_SUFFIX_RE = re.compile(r"\s*[Vv]?\d+(?:\.\d+)+\s*$")
+
+
+def _family(stem: str) -> str:
+    """A workbook's name with any trailing version token removed, so
+    "Technical Infrastructure Assessment V2.6.4" and "... V2.6.5" share a
+    family and the older one can be recognised as superseded."""
+    return _VERSION_SUFFIX_RE.sub("", stem).strip().casefold()
+
+
+def wipe_stale_sheet_sources(reference_json_dir: Path) -> int:
+    """Delete the previous workbook's per-sheet source JSONs, keeping the
+    `extracted_*.json` rubric.
+
+    The converter's own `clean_output_first` wipe is all-or-nothing and would
+    also delete the rubric, leaving nothing to fall back on if the extraction
+    that replaces it then fails part-way. Returns the number deleted.
+    """
+    if not reference_json_dir.is_dir():
+        return 0
+    wiped = 0
+    for p in reference_json_dir.glob("*.json"):
+        if p.is_file() and not p.name.startswith("extracted_"):
+            p.unlink()
+            wiped += 1
+    logger.info(
+        "wiped %d stale per-sheet source JSON(s) from %s (rubric preserved)",
+        wiped, reference_json_dir,
+    )
+    return wiped
+
+
+def retire_superseded(loaded_dir: Path, just_loaded: list[Path]) -> int:
+    """Move older versions of a just-ingested workbook into `Superseded/`.
+
+    The RAG sync gate matches on basename, so bumping a version ("V2.6.4" ->
+    "V2.6.5") renames the file and leaves the previous workbook sitting in
+    REFERENCE_LOADED_DIR with nothing to retire it — an operator then cannot tell
+    which version is live, and re-dropping the old one would silently re-ingest
+    it. Superseded files are MOVED, never deleted: the retention policy is to
+    keep everything. Returns the number retired.
+    """
+    retired = 0
+    for new in just_loaded:
+        family = _family(new.stem)
+        if not family:
+            continue                      # nothing but a version — too risky to match on
+        for existing in sorted(loaded_dir.glob("*.xls[xm]")):
+            if existing.name == new.name or _family(existing.stem) != family:
+                continue
+            target_dir = loaded_dir / SUPERSEDED_DIR_NAME
+            target_dir.mkdir(parents=True, exist_ok=True)
+            move_replacing(existing, target_dir / existing.name)
+            logger.info(
+                "retired superseded reference: %s -> %s/ (replaced by %s)",
+                existing.name, SUPERSEDED_DIR_NAME, new.name,
+            )
+            retired += 1
+    return retired
 
 
 def extract() -> int:
@@ -55,13 +122,20 @@ def extract() -> int:
     # converter's same-path guard), processed_dir = loaded_dir. After both
     # stages run, finalize_to_processed_dir() moves successfully-converted
     # xlsx from inbox to loaded; failed conversions remain in the inbox.
+    # clean_output_first is OFF deliberately: the converter's wipe clears EVERY
+    # top-level file in the output dir, which would take the previous
+    # `extracted_*.json` rubric with it — before the LLM extraction that replaces
+    # it has even started. A sheet failing mid-extraction would then leave no
+    # rubric at all. Only the stale per-sheet source JSONs are cleared here; the
+    # extractor swaps the rubric itself, atomically, once every sheet succeeds.
     converter = ExcelToJsonConverter(
         input_dir=to_be_loaded_dir,
         output_dir=reference_json_dir,
         processing_dir=to_be_loaded_dir,
         processed_dir=loaded_dir,
-        clean_output_first=True,
+        clean_output_first=False,
     )
+    wipe_stale_sheet_sources(reference_json_dir)
     logger.info(
         "-- stage: convert reference excel (%d xlsx in inbox) --", len(incoming)
     )
@@ -87,8 +161,12 @@ def extract() -> int:
     rc_extract = extractor.extract_sheets()
     logger.info("extract stage finished (rc=%d)", rc_extract)
 
-    # Finalize: move successfully-converted xlsx from inbox to loaded.
+    # Finalize: move successfully-converted xlsx from inbox to loaded, then
+    # retire any older version of each (finalize clears the tracking list, so
+    # the names are captured first).
+    loaded_names = [p.name for p in converter.successfully_processed_paths]
     moved = converter.finalize_to_processed_dir()
     logger.info("moved %d xlsx to %s", moved, loaded_dir)
+    retire_superseded(loaded_dir, [loaded_dir / n for n in loaded_names])
 
     return rc_convert or rc_extract
