@@ -49,6 +49,17 @@ class GatewayUnreachable(RuntimeError):
     Distinct from per-request failures so the caller can abort early."""
 
 
+class QuotaExceeded(RuntimeError):
+    """Raised on HTTP 429 — the gateway answered but refuses to serve us
+    (rate limit or monthly spend cap).
+
+    Distinct from GatewayUnreachable (which is a connectivity problem) and from
+    an ordinary per-sheet error (which is worth skipping past): no later sheet
+    can succeed either, so the caller aborts immediately rather than spending
+    minutes on calls that will all fail the same way.
+    """
+
+
 EXTRACT_SYSTEM_PROMPT = """You are an analyst preparing input for a Technical Infrastructure Assessment (TIA).
 You will receive the JSON contents of ONE sheet from a TIA reference workbook. The sheet name is given.
 
@@ -74,10 +85,22 @@ secured?") — this is required so downstream reports can show the complete
 question. Use a short snake_case key for the item AND keep this full "question"
 value; that is the one place full wording is retained.
 
+Where the sheet says what the customer must actually DO to reach the good rating
+— required switches, settings, user roles, thresholds, locations, schedules —
+capture it under the canonical key "guidance" (one short string). When the source
+names MORE THAN ONE required action, ALSO emit "remediation_steps": a list of
+short strings, one per action, preserving EVERY action. Use exactly these two key
+names, never synonyms ("note", "notes", "aim", "context", "reference"), so
+downstream reports can find them. Example: a question whose help text says three
+things are required to enforce Runtime Resource authentication must yield three
+remediation_steps, not a summary that mentions two of them.
+
 Keep the rest of the JSON COMPACT — large sheets otherwise overflow the response limit:
-- Do NOT copy long guidance / help / explanatory paragraphs verbatim. Where a
-  scoring table gives per-option guidance, condense it to at most one short
-  phrase, or omit it and keep just the option label and its score/rating.
+- Do NOT copy long guidance / help / explanatory paragraphs verbatim. Condense
+  background and rationale to at most one short phrase, or omit it. This applies
+  to narrative only: actionable content belongs in "guidance" /
+  "remediation_steps" per the rule above and is NEVER dropped. What gets cut is
+  explanation, not the actions a customer has to take.
 - Apart from the required "question" field, do not repeat wording; keep every
   other value to the essential fact.
 - For scoring/rating tables, prefer capturing the recommended/best value and
@@ -134,21 +157,15 @@ class ReferenceSheetExtractor:
             logger.error("No .json files found in %s", self.reference_json_dir)
             return 1
 
-        # Selective wipe: only delete previous-run extractions
-        # (`extracted_*.json`). The source per-sheet JSONs the converter
-        # just wrote share this dir and must be preserved.
-        wiped = 0
-        for p in self.reference_json_dir.glob("extracted_*.json"):
-            if p.is_file():
-                p.unlink()
-                wiped += 1
-        logger.info(
-            "wiped %d previous extracted_*.json file(s) from %s",
-            wiped, self.reference_json_dir,
-        )
         logger.info("extract_sheets() starting: %d source file(s)", len(json_files))
 
-        non_empty = 0
+        # Extract EVERY sheet before touching the previous set. Wiping first and
+        # writing as we went meant a mid-run failure (rate limit, spend cap) left
+        # a half-rubric on disk with the good one already deleted — unrecoverable
+        # without re-running. Results are held in memory (~200 KB) and only
+        # swapped in once all sheets succeed, so a failure is a true no-op.
+        extracted_by_sheet: list[tuple[str, dict]] = []
+        failed: list[str] = []
         for jf in json_files:
             sheet_name = self._sheet_name_from_filename(jf)
             try:
@@ -160,33 +177,63 @@ class ReferenceSheetExtractor:
 
             try:
                 extracted = self._extract_sheet(sheet_name, sheet_data)
-            except GatewayUnreachable as exc:
+            except (GatewayUnreachable, QuotaExceeded) as exc:
+                # Unreachable or refused-for-billing: the remaining sheets cannot
+                # succeed either, so stop now instead of spending minutes on calls
+                # that will all fail. Nothing has been written, so the previous
+                # rubric is untouched.
                 logger.error(
                     "Aborting: %s (no further sheets will be attempted)", exc
                 )
                 return 1
             except Exception as exc:
                 # LLM call failure was already logged inside _call_llm; this
-                # records the higher-level "skipping this sheet" decision.
+                # records the higher-level "skipping this sheet" decision. The
+                # sheet is recorded as failed so the run reports failure rather
+                # than letting a partial rubric reach the RAG sync.
                 logger.warning("skip (extract error) %s: %s", jf.name, exc)
+                failed.append(sheet_name)
                 continue
 
             if extracted:
-                non_empty += 1
-                ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-                per_sheet_path = self.reference_json_dir / f"extracted_{sheet_name}_{ts}.json"
-                with per_sheet_path.open("w", encoding="utf-8") as f:
-                    json.dump(extracted, f, ensure_ascii=False, indent=2)
-                logger.info(
-                    "extracted %s -> %d topic(s) (wrote %s)",
-                    jf.name, len(extracted), per_sheet_path.name,
-                )
+                extracted_by_sheet.append((sheet_name, extracted))
+                logger.info("extracted %s -> %d topic(s)", jf.name, len(extracted))
             else:
                 logger.info("extracted %s -> (no relevant content)", jf.name)
 
+        if failed:
+            # A per-sheet failure (rate limit, spend cap, malformed response)
+            # used to be swallowed: the stage returned success and the RAG sync
+            # then mirrored the half-written rubric, deleting good entries and
+            # replacing them with a partial set. Reporting failure lets the
+            # caller leave RAG alone and retry on the next run.
+            logger.error(
+                "extract_sheets(): %d of %d sheet(s) FAILED to extract (%s); "
+                "the previous rubric in %s is left untouched and nothing is "
+                "synced to RAG — re-run to retry",
+                len(failed), len(json_files), ", ".join(sorted(failed)),
+                self.reference_json_dir,
+            )
+            return 1
+
+        # Every sheet succeeded — now, and only now, replace the previous set.
+        # Selective wipe: the source per-sheet JSONs the converter just wrote
+        # share this directory and must be preserved.
+        wiped = 0
+        for p in self.reference_json_dir.glob("extracted_*.json"):
+            if p.is_file():
+                p.unlink()
+                wiped += 1
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        for sheet_name, extracted in extracted_by_sheet:
+            path = self.reference_json_dir / f"extracted_{sheet_name}_{ts}.json"
+            with path.open("w", encoding="utf-8") as f:
+                json.dump(extracted, f, ensure_ascii=False, indent=2)
         logger.info(
-            "extract_sheets() finished: %d non-empty extraction(s) written to %s",
-            non_empty, self.reference_json_dir,
+            "extract_sheets() finished: replaced %d previous extraction(s) with "
+            "%d new one(s) in %s (%s)",
+            wiped, len(extracted_by_sheet), self.reference_json_dir,
+            ", ".join(name for name, _ in extracted_by_sheet),
         )
         return 0
 
@@ -259,6 +306,14 @@ class ReferenceSheetExtractor:
             except TRANSIENT_ERRORS as exc:
                 raise GatewayUnreachable(f"Cannot reach gateway at {url}: {exc}") from exc
 
+            if response.status_code == 429:
+                # Rate limit / monthly spend cap. Surfaced as its own type so the
+                # sheet loop aborts the whole run instead of retrying each
+                # remaining sheet into the same wall.
+                raise QuotaExceeded(
+                    f"LLM HTTP 429 (rate limit or spend cap) at {url}: "
+                    f"{response.text[:300]}"
+                )
             raise_for_status(response, label="LLM", error_cls=RuntimeError)
             payload = parse_json(response, label="LLM", error_cls=RuntimeError)
 
@@ -283,6 +338,9 @@ class ReferenceSheetExtractor:
                 raise RuntimeError(f"LLM returned non-object JSON: {type(parsed).__name__}")
         except GatewayUnreachable as exc:
             logger.error("LLM call FAILED (gateway): %s: %s", label, exc)
+            raise
+        except QuotaExceeded as exc:
+            logger.error("LLM call REFUSED (quota): %s: %s", label, exc)
             raise
         except Exception as exc:
             logger.error("LLM call FAILED: %s: %s", label, exc)
