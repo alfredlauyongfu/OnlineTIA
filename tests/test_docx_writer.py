@@ -126,6 +126,28 @@ def test_running_headers_are_static_text(tmp_path: Path) -> None:
     assert "PAGE" in z.read("word/footer3.xml").decode("utf-8")
 
 
+def test_headers_hold_no_property_bound_controls(tmp_path: Path) -> None:
+    """Headers and footers must not contain content controls bound to document
+    properties.
+
+    Such a control re-reads its property when Word opens the file and renders a
+    grey placeholder when that property is empty — clearing the source
+    document's metadata put a literal "[Subject]" in the page header.
+    """
+    import re
+    import zipfile
+
+    z = zipfile.ZipFile(str(_write(tmp_path)))
+    for name in z.namelist():
+        if not re.match(r"word/(header|footer)\d*\.xml", name):
+            continue
+        xml = z.read(name).decode("utf-8")
+        assert "<w:sdt>" not in xml, f"{name} still has a content control"
+        assert "dataBinding" not in xml, f"{name} still binds a document property"
+    # Page numbering is a field and must survive.
+    assert "PAGE" in z.read("word/footer3.xml").decode("utf-8")
+
+
 def test_write_docx_creates_parent_dir(tmp_path: Path) -> None:
     out = tmp_path / "nested" / "deep" / "r.docx"
     write_docx(["## S\ncontent"], out, organisation="Acme", assessment_date="")
